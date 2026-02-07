@@ -4,19 +4,24 @@
     android:height="108dp"
     android:viewportWidth="108"
     android:viewportHeight="108">
-    
-    <!-- Background rounded rectangle with gradient -->
-    <path
-        android:fillColor="#F59E0B"
-        android:pathData="M22,22 L86,22 Q90,22 90,26 L90,82 Q90,86 86,86 L22,86 Q18,86 18,82 L18,26 Q18,22 22,22 Z"/>
-    
-    <!-- Letter D -->
+
+    <!-- Bold capital D - white, large and centered -->
     <path
         android:fillColor="#FFFFFF"
-        android:pathData="M28,36 L42,36 Q54,36 54,54 Q54,72 42,72 L28,72 Z M36,44 L36,64 L40,64 Q46,64 46,54 Q46,44 40,44 Z"/>
-    
-    <!-- Letter X -->
-    <path
-        android:fillColor="#FFFFFF"
-        android:pathData="M58,36 L67,36 L72,48 L77,36 L86,36 L77,54 L86,72 L77,72 L72,60 L67,72 L58,72 L67,54 Z"/>
+        android:pathData="M34,28 L54,28
+            Q62,28 67.5,31.5
+            Q73,35 76,41
+            Q79,47 79,54
+            Q79,61 76,67
+            Q73,73 67.5,76.5
+            Q62,80 54,80
+            L34,80 Z
+            M45,39 L45,69 L53,69
+            Q58,69 61.5,66.5
+            Q65,64 66.5,60
+            Q68,56 68,54
+            Q68,52 66.5,48
+            Q65,44 61.5,41.5
+            Q58,39 53,39 Z" />
+
 </vector>

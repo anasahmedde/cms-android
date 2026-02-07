@@ -40,7 +40,8 @@
 
     <application
         android:icon="@mipmap/ic_launcher"
-        android:label="DGX"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:label="DGX Player"
         android:allowBackup="true"
         android:supportsRtl="true"
         android:usesCleartextTraffic="true"

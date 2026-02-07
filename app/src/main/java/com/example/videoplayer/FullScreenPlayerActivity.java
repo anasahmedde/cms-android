@@ -101,7 +101,17 @@ import java.util.UUID;
 public class FullScreenPlayerActivity extends AppCompatActivity implements TextureView.SurfaceTextureListener {
 
     private static final String TAG = "FullScreenPlayer";
+
+    // ==========================================
+    // BACKEND URL CONFIGURATION - CHANGE THIS
+    // ==========================================
     private static final String API_BASE = "http://34.248.112.237:8005";
+    // ==========================================
+
+    // Network timeouts (milliseconds)
+    private static final int CONNECT_TIMEOUT_MS = 15_000;
+    private static final int READ_TIMEOUT_MS = 30_000;
+    private static final int DOWNLOAD_TIMEOUT_MS = 120_000;
 
     private static String listDownloadsUrl(String id) { return API_BASE + "/device/" + id + "/videos/downloads"; }
     private static String readStatusUrl(String id) { return API_BASE + "/device/" + id + "/download_status"; }
@@ -463,8 +473,8 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
                 Log.d(TAG, "Checking enrollment: " + urlStr);
 
                 HttpURLConnection c = (HttpURLConnection) new URL(urlStr).openConnection();
-                c.setConnectTimeout(10_000);
-                c.setReadTimeout(10_000);
+                c.setConnectTimeout(CONNECT_TIMEOUT_MS);
+                c.setReadTimeout(READ_TIMEOUT_MS);
                 c.setRequestMethod("GET");
                 c.connect();
 
@@ -540,9 +550,9 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
 
             // Update button text temporarily to show feedback
             if (copyButton != null) {
-                copyButton.setText("✓  Copied!");
+                copyButton.setText("Copied!");
                 copyButton.postDelayed(() -> {
-                    copyButton.setText("📋  Copy to Clipboard");
+                    copyButton.setText("Copy to Clipboard");
                 }, 2000);
             }
 
@@ -560,8 +570,8 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
                 Log.d(TAG, "Polling rotation from: " + urlStr);
 
                 HttpURLConnection c = (HttpURLConnection) new URL(urlStr).openConnection();
-                c.setConnectTimeout(10_000);
-                c.setReadTimeout(10_000);
+                c.setConnectTimeout(CONNECT_TIMEOUT_MS);
+                c.setReadTimeout(READ_TIMEOUT_MS);
                 c.setRequestMethod("GET");
                 c.connect();
 
@@ -1023,8 +1033,8 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
         try {
             String urlStr = listDownloadsUrl(deviceId);
             HttpURLConnection c = (HttpURLConnection) new URL(urlStr).openConnection();
-            c.setConnectTimeout(10_000);
-            c.setReadTimeout(10_000);
+            c.setConnectTimeout(CONNECT_TIMEOUT_MS);
+            c.setReadTimeout(READ_TIMEOUT_MS);
             c.setRequestMethod("GET");
             c.connect();
 
@@ -1229,7 +1239,7 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
 
     private void postOnlineTrue(String url) throws Exception {
         HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
-        c.setConnectTimeout(20_000); c.setReadTimeout(30_000);
+        c.setConnectTimeout(CONNECT_TIMEOUT_MS); c.setReadTimeout(READ_TIMEOUT_MS);
         c.setRequestMethod("POST"); c.setDoOutput(true);
         c.setRequestProperty("Content-Type", "application/json; charset=UTF-8");
         try (DataOutputStream out = new DataOutputStream(c.getOutputStream())) {
@@ -1317,7 +1327,7 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
 
     private List<String> fetchDownloadUrls(String url) throws Exception {
         HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
-        c.setConnectTimeout(20_000); c.setReadTimeout(30_000); c.setRequestMethod("GET"); c.connect();
+        c.setConnectTimeout(CONNECT_TIMEOUT_MS); c.setReadTimeout(READ_TIMEOUT_MS); c.setRequestMethod("GET"); c.connect();
         int responseCode = c.getResponseCode();
 
         // Handle 404 gracefully - device has no videos linked yet
@@ -1347,7 +1357,7 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
     // Returns list of expected filenames from server
     private List<String> fetchExpectedFilenames(String url) throws Exception {
         HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
-        c.setConnectTimeout(20_000); c.setReadTimeout(30_000); c.setRequestMethod("GET"); c.connect();
+        c.setConnectTimeout(CONNECT_TIMEOUT_MS); c.setReadTimeout(READ_TIMEOUT_MS); c.setRequestMethod("GET"); c.connect();
         if (c.getResponseCode() / 100 != 2) { c.disconnect(); return new ArrayList<>(); }
         StringBuilder sb = new StringBuilder();
         try (BufferedReader br = new BufferedReader(new InputStreamReader(c.getInputStream(), StandardCharsets.UTF_8))) {
@@ -1391,7 +1401,7 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
 
         for (int attempt = 0; attempt < MAX_RETRIES; attempt++) {
             HttpURLConnection c = (HttpURLConnection) new URL(finalUrl).openConnection();
-            c.setConnectTimeout(120_000); c.setReadTimeout(120_000);
+            c.setConnectTimeout(DOWNLOAD_TIMEOUT_MS); c.setReadTimeout(DOWNLOAD_TIMEOUT_MS);
             if (have > 0) c.setRequestProperty("Range", "bytes=" + have + "-");
             int code = c.getResponseCode();
             if (code == 200 || code == 206) {
@@ -1643,6 +1653,21 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
 
     // ===== IMAGE DISPLAY METHODS =====
 
+    /** Calculate optimal inSampleSize for bitmap loading to prevent OOM */
+    private int calculateInSampleSize(BitmapFactory.Options options, int reqWidth, int reqHeight) {
+        int height = options.outHeight;
+        int width = options.outWidth;
+        int inSampleSize = 1;
+        if (height > reqHeight || width > reqWidth) {
+            int halfH = height / 2;
+            int halfW = width / 2;
+            while ((halfH / inSampleSize) >= reqHeight && (halfW / inSampleSize) >= reqWidth) {
+                inSampleSize *= 2;
+            }
+        }
+        return inSampleSize;
+    }
+
     /**
      * Display a single image with rotation and fit mode
      */
@@ -1653,8 +1678,18 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
         }
 
         try {
-            // Load bitmap
-            Bitmap bitmap = BitmapFactory.decodeFile(imageFile.getAbsolutePath());
+            // Load bitmap with inSampleSize for large images to prevent OOM
+            BitmapFactory.Options opts = new BitmapFactory.Options();
+            opts.inJustDecodeBounds = true;
+            BitmapFactory.decodeFile(imageFile.getAbsolutePath(), opts);
+
+            // Calculate sample size if image is very large (>4096 in any dimension)
+            int maxDim = Math.max(screenWidth, screenHeight);
+            if (maxDim <= 0) maxDim = 1920;
+            opts.inSampleSize = calculateInSampleSize(opts, maxDim, maxDim);
+            opts.inJustDecodeBounds = false;
+
+            Bitmap bitmap = BitmapFactory.decodeFile(imageFile.getAbsolutePath(), opts);
             if (bitmap == null) {
                 Log.e(TAG, "Failed to decode image: " + imageFile.getName());
                 return;
@@ -1947,7 +1982,7 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
 
     private boolean readDownloadStatus(String url) throws Exception {
         HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
-        c.setConnectTimeout(20_000); c.setReadTimeout(30_000); c.connect();
+        c.setConnectTimeout(CONNECT_TIMEOUT_MS); c.setReadTimeout(READ_TIMEOUT_MS); c.connect();
         if (c.getResponseCode() / 100 != 2) { c.disconnect(); return false; }
         StringBuilder sb = new StringBuilder();
         try (BufferedReader br = new BufferedReader(new InputStreamReader(c.getInputStream(), StandardCharsets.UTF_8))) {

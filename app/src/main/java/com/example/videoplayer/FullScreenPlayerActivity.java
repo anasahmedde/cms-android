@@ -105,7 +105,7 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
     // ==========================================
     // BACKEND URL CONFIGURATION - CHANGE THIS
     // ==========================================
-    private static final String API_BASE = "http://34.248.112.237:8005";
+    private static final String API_BASE = "https://api-staging-cms.wizioners.com";
     // ==========================================
 
     // Network timeouts (milliseconds)

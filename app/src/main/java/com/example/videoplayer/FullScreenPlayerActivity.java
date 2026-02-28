@@ -105,7 +105,7 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
     // ==========================================
     // BACKEND URL CONFIGURATION - CHANGE THIS
     // ==========================================
-    private static final String API_BASE = "http://34.248.112.237:8005";
+    private static final String API_BASE = "https://api-staging-cms.wizioners.com";
     // ==========================================
 
     // Network timeouts (milliseconds)
@@ -129,6 +129,9 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
     private TextView retryText;
     private Button copyButton;
     private volatile boolean isEnrolled = false;
+    private static final String PREFS_NAME = "digix_player_prefs";
+    private static final String PREF_WAS_ENROLLED = "was_enrolled";
+    private static final String PREF_LAYOUT_JSON = "cached_layout_json";
     private static final long ENROLLMENT_CHECK_MS = 15_000L; // Check every 15 seconds
     private final Handler enrollmentCheckHandler = new Handler(Looper.getMainLooper());
     private final Runnable enrollmentCheckRunnable = new Runnable() {
@@ -349,8 +352,11 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
     protected void onResume() {
         super.onResume();
         applyImmersive();
-        pollHandler.removeCallbacksAndMessages(null);
-        pollHandler.postDelayed(pollRunnable, POLL_MS);
+        // Only restart poll handler if device is enrolled (otherwise enrollment check will start it)
+        if (isEnrolled) {
+            pollHandler.removeCallbacksAndMessages(null);
+            pollHandler.postDelayed(pollRunnable, POLL_MS);
+        }
         rotationPollHandler.removeCallbacksAndMessages(null);
         rotationPollHandler.postDelayed(rotationPollRunnable, 1000);
     }
@@ -461,6 +467,29 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
         new Thread(() -> {
             try {
                 if (!isOnline()) {
+                    // Check if device was previously enrolled and has local content
+                    boolean wasEnrolled = getSharedPreferences(PREFS_NAME, MODE_PRIVATE).getBoolean(PREF_WAS_ENROLLED, false);
+                    if (wasEnrolled && !isEnrolled) {
+                        // Offline but was previously enrolled - play cached content
+                        File mainDir = ensureMainDir();
+                        File[] localFiles = mainDir.listFiles();
+                        if (localFiles != null && localFiles.length > 0) {
+                            Log.d(TAG, "Offline but previously enrolled - playing " + localFiles.length + " cached files");
+                            isEnrolled = true;
+                            // Load cached layout mode and metadata (rotation, fit, grid positions)
+                            loadCachedLayoutMetadata();
+                            ui.post(() -> {
+                                showEnrollmentOverlay(false);
+                                // Use correct layout mode from cache
+                                if ("single".equals(layoutMode) || layoutMode == null) {
+                                    playMixedPlaylist(mainDir);
+                                } else {
+                                    switchToGridMode();
+                                }
+                            });
+                            return;
+                        }
+                    }
                     ui.post(() -> {
                         if (retryText != null) {
                             retryText.setText("No internet connection. Retrying...");
@@ -486,8 +515,13 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
                     Log.d(TAG, "Device is enrolled!");
                     if (!isEnrolled) {
                         isEnrolled = true;
+                        // Persist enrolled state for offline recovery
+                        getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit().putBoolean(PREF_WAS_ENROLLED, true).apply();
                         ui.post(() -> {
                             showEnrollmentOverlay(false);
+                            // Restart poll handler for heartbeats and sync
+                            pollHandler.removeCallbacksAndMessages(null);
+                            pollHandler.postDelayed(pollRunnable, POLL_MS);
                             // Now start the video player
                             ensureAllFilesAccessThenStart();
                         });
@@ -497,12 +531,16 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
                     Log.d(TAG, "Device not enrolled or deactivated (404)");
                     boolean wasEnrolled = isEnrolled;
                     isEnrolled = false;
+                    // Persist unenrolled state
+                    getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit().putBoolean(PREF_WAS_ENROLLED, false).apply();
                     ui.post(() -> {
                         // Stop all playback if device was previously enrolled
                         if (wasEnrolled) {
                             Log.d(TAG, "Device was deactivated - stopping playback");
                             stopAllPlayback();
                         }
+                        // Stop poll handler so it doesn't restart playback
+                        pollHandler.removeCallbacksAndMessages(null);
                         showEnrollmentOverlay(true);
                         if (retryText != null) {
                             retryText.setText("Device not enrolled. Checking again in 15 seconds...");
@@ -973,8 +1011,16 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
                 try { postOnlineTrue(updateOnlineUrl(id)); } catch (Exception ignored) {}
 
                 if (!isOnline()) {
-                    ui.post(() -> toast("Offline - playing local content"));
-                    ui.post(() -> playMixedPlaylist(mainDir));
+                    // Load cached layout metadata for correct grid/rotation/fit mode
+                    loadCachedLayoutMetadata();
+                    ui.post(() -> {
+                        toast("Offline - playing local content");
+                        if ("single".equals(layoutMode) || layoutMode == null) {
+                            playMixedPlaylist(mainDir);
+                        } else {
+                            switchToGridMode();
+                        }
+                    });
                     return;
                 }
 
@@ -1018,10 +1064,17 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
                 });
             } catch (Exception e) {
                 ui.post(() -> toast("Error: " + e.getMessage()));
-                // On error, try to play local content anyway
+                // On error, try to play local content anyway with cached layout
                 try {
                     File mainDir = ensureMainDir();
-                    ui.post(() -> playMixedPlaylist(mainDir));
+                    loadCachedLayoutMetadata();
+                    ui.post(() -> {
+                        if ("single".equals(layoutMode) || layoutMode == null) {
+                            playMixedPlaylist(mainDir);
+                        } else {
+                            switchToGridMode();
+                        }
+                    });
                 } catch (Exception ignored) {}
             }
             finally { isWorking = false; }
@@ -1045,14 +1098,28 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
                 String line; while ((line = br.readLine()) != null) sb.append(line);
             } finally { c.disconnect(); }
 
+            String jsonStr = sb.toString();
+            // Cache the raw JSON for offline recovery
+            getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit().putString(PREF_LAYOUT_JSON, jsonStr).apply();
+
+            parseLayoutJson(jsonStr);
+        } catch (Exception e) {
+            Log.e(TAG, "Failed to fetch layout mode: " + e.getMessage());
+            layoutMode = "single";
+        }
+    }
+
+    /** Parse layout JSON and populate layoutMode + metadata maps. Called from both online fetch and offline cache. */
+    private void parseLayoutJson(String jsonStr) {
+        try {
             Map<String, VideoMetadata> byName = new HashMap<>();
             Map<String, VideoMetadata> byFile = new HashMap<>();
 
-            JSONObject obj = new JSONObject(sb.toString());
+            JSONObject obj = new JSONObject(jsonStr);
 
             // Parse layout mode
             layoutMode = obj.optString("layout_mode", "single");
-            Log.d(TAG, "Fetched layout_mode: " + layoutMode);
+            Log.d(TAG, "Parsed layout_mode: " + layoutMode);
 
             JSONArray items = obj.optJSONArray("items");
             if (items != null) {
@@ -1077,9 +1144,24 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
             metadataByVideoName = byName;
             metadataByFilename = byFile;
         } catch (Exception e) {
-            Log.e(TAG, "Failed to fetch layout mode: " + e.getMessage());
+            Log.e(TAG, "Failed to parse layout JSON: " + e.getMessage());
             layoutMode = "single";
         }
+    }
+
+    /** Load cached layout JSON from SharedPreferences. Returns true if cache was found and loaded. */
+    private boolean loadCachedLayoutMetadata() {
+        try {
+            String cachedJson = getSharedPreferences(PREFS_NAME, MODE_PRIVATE).getString(PREF_LAYOUT_JSON, null);
+            if (cachedJson != null && !cachedJson.isEmpty()) {
+                parseLayoutJson(cachedJson);
+                Log.d(TAG, "Loaded cached layout: mode=" + layoutMode);
+                return true;
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "Failed to load cached layout: " + e.getMessage());
+        }
+        return false;
     }
 
     // Smart sync: only download new videos/images, delete unassigned ones
@@ -1192,6 +1274,7 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
     }
 
     private void startBackgroundCheckIfNeeded() {
+        if (!isEnrolled) return; // Don't sync if device is not enrolled
         if (isWorking || downloadInProgress) return;
         isWorking = true;
         new Thread(() -> {
@@ -1234,6 +1317,7 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
     }
 
     private void sendOnlineHeartbeat() {
+        if (!isEnrolled) return; // Don't send heartbeat if device is not enrolled
         new Thread(() -> { try { postOnlineTrue(updateOnlineUrl(getAndroidId())); } catch (Exception ignored) {} }).start();
     }
 

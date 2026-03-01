@@ -51,6 +51,7 @@ import android.os.Bundle;
 import android.os.Environment;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.StatFs;
 import android.provider.Settings;
 import android.util.DisplayMetrics;
 import android.util.Log;
@@ -179,6 +180,9 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
     private volatile boolean isWorking = false;
     private volatile boolean downloadInProgress = false;
 
+    // Storage management - report storage to server for dashboard visibility
+    private static String storageReportUrl(String id) { return API_BASE + "/device/" + id + "/storage/report"; }
+
     // Screen dimensions
     private int screenWidth = 0;
     private int screenHeight = 0;
@@ -306,6 +310,9 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
         // Check enrollment first before starting everything
         checkEnrollmentStatus();
         enrollmentCheckHandler.postDelayed(enrollmentCheckRunnable, ENROLLMENT_CHECK_MS);
+
+        // NEW: Report storage status when app starts
+        reportStorageToServer();
 
         tempHandler.postDelayed(tempPostRunnable, TEMP_POST_INTERVAL_MS);
         rotationPollHandler.postDelayed(rotationPollRunnable, ROTATION_POLL_MS);
@@ -1166,6 +1173,97 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
 
     // Smart sync: only download new videos/images, delete unassigned ones
     // Returns true if all expected content is now available locally
+    // ═══════════════════════════════════════════════════════════════════════════
+    // STORAGE MANAGEMENT - Report storage & reuse local files
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /**
+     * Read response body from HttpURLConnection
+     */
+    private String readResponse(HttpURLConnection conn) throws Exception {
+        StringBuilder sb = new StringBuilder();
+        try (BufferedReader br = new BufferedReader(
+                new InputStreamReader(conn.getInputStream(), StandardCharsets.UTF_8))) {
+            String line;
+            while ((line = br.readLine()) != null) {
+                sb.append(line);
+            }
+        }
+        return sb.toString();
+    }
+
+    /**
+     * Reports device storage capacity and usage to the server.
+     * Called on startup and after downloads for dashboard visibility.
+     */
+    private void reportStorageToServer() {
+        new Thread(() -> {
+            try {
+                File storageDir = getExternalFilesDir(null);
+                if (storageDir == null) return;
+
+                // Get storage statistics
+                StatFs stat = new StatFs(storageDir.getPath());
+                long totalBytes = stat.getTotalBytes();
+                long availableBytes = stat.getAvailableBytes();
+                long usedBytes = totalBytes - availableBytes;
+
+                // Calculate content storage (files in our app directory)
+                long contentBytes = calculateContentSize(ensureMainDir());
+
+                String url = storageReportUrl(getAndroidId());
+                HttpURLConnection conn = (HttpURLConnection) new URL(url).openConnection();
+                conn.setRequestMethod("POST");
+                conn.setRequestProperty("Content-Type", "application/json");
+                conn.setDoOutput(true);
+                conn.setConnectTimeout(10000);
+
+                JSONObject body = new JSONObject();
+                body.put("total_bytes", totalBytes);
+                body.put("used_bytes", usedBytes);
+                body.put("content_bytes", contentBytes);
+
+                try (DataOutputStream out = new DataOutputStream(conn.getOutputStream())) {
+                    out.writeBytes(body.toString());
+                }
+
+                int responseCode = conn.getResponseCode();
+                if (responseCode == 200) {
+                    Log.d(TAG, String.format("Storage reported: total=%d, used=%d, content=%d",
+                            totalBytes, usedBytes, contentBytes));
+                }
+
+                conn.disconnect();
+            } catch (Exception e) {
+                Log.e(TAG, "Error reporting storage: " + e.getMessage());
+            }
+        }).start();
+    }
+
+    /**
+     * Calculate total size of downloaded content files.
+     */
+    private long calculateContentSize(File directory) {
+        long size = 0;
+        File[] files = directory.listFiles((dir, name) -> {
+            String lower = name.toLowerCase();
+            return lower.endsWith(".mp4") || lower.endsWith(".jpg") ||
+                    lower.endsWith(".jpeg") || lower.endsWith(".png") ||
+                    lower.endsWith(".gif") || lower.endsWith(".webp");
+        });
+
+        if (files != null) {
+            for (File file : files) {
+                size += file.length();
+            }
+        }
+        return size;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // SMART SYNC - Reuses local files, only downloads new content, NEVER deletes
+    // ═══════════════════════════════════════════════════════════════════════════
+
     private boolean smartSyncVideos(File mainDir, String deviceId) throws Exception {
         String url = listDownloadsUrl(deviceId);
 
@@ -1192,51 +1290,37 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
             }
         }
 
-        // Determine which files to download (new ones)
+        // Determine which files to download (only NEW ones - reuse local!)
         List<String> urlsToDownload = new ArrayList<>();
-        Set<String> expectedSet = new HashSet<>();
+
         for (int i = 0; i < downloadUrls.size(); i++) {
             String urlStr = downloadUrls.get(i);
             String filename = i < expectedFilenames.size() ? expectedFilenames.get(i) : filenameFromUrl(urlStr);
-            expectedSet.add(filename.toLowerCase());
 
+            // KEY: Only download if NOT already local (reuse existing files!)
             if (!localFilenames.contains(filename.toLowerCase())) {
                 urlsToDownload.add(urlStr);
                 Log.d(TAG, "Will download new content: " + filename);
             } else {
-                Log.d(TAG, "Content already exists locally: " + filename);
+                Log.d(TAG, "Reusing local content: " + filename);
             }
         }
 
-        // Determine which local files to delete (unassigned)
-        List<File> filesToDelete = new ArrayList<>();
-        if (localFiles != null) {
-            for (File f : localFiles) {
-                if (!expectedSet.contains(f.getName().toLowerCase())) {
-                    filesToDelete.add(f);
-                    Log.d(TAG, "Will delete unassigned content: " + f.getName());
-                }
-            }
-        }
+        // NOTE: We do NOT delete unassigned content anymore!
+        // Content stays on device for future reuse
 
-        // Delete unassigned content
-        for (File f : filesToDelete) {
-            if (f.delete()) {
-                Log.d(TAG, "Deleted: " + f.getName());
-            }
-        }
-
-        // Download new content (videos and images) directly to main directory
+        // Download only NEW content
         if (!urlsToDownload.isEmpty()) {
             ui.post(() -> toast("Downloading " + urlsToDownload.size() + " new file(s)…"));
             int downloaded = 0;
             int failed = 0;
+
             for (String urlStr : urlsToDownload) {
                 try {
                     File f = bigFileDownloadWithResume(urlStr, mainDir);
                     if (f != null && f.exists() && f.length() > 0) {
                         downloaded++;
-                        Log.d(TAG, "Downloaded: " + f.getName());
+                        Log.d(TAG, "Downloaded: " + f.getName() + " (" + f.length() + " bytes)");
                     } else {
                         failed++;
                         Log.e(TAG, "Download returned null or empty file for: " + urlStr);
@@ -1246,6 +1330,10 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
                     Log.e(TAG, "Download failed: " + e.getMessage());
                 }
             }
+
+            // Report storage after downloads (for dashboard visibility)
+            reportStorageToServer();
+
             final int finalDownloaded = downloaded;
             final int finalFailed = failed;
 
@@ -1255,21 +1343,15 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
                 ui.post(() -> toast("Downloaded " + finalDownloaded + " file(s)"));
             }
 
-            // Refresh playlist if we downloaded something or deleted something
-            if (downloaded > 0 || !filesToDelete.isEmpty()) {
+            // Refresh playlist if we downloaded something
+            if (downloaded > 0) {
                 stopPlaybackForRefresh();
             }
 
-            // Return true only if ALL downloads succeeded
             return failed == 0;
-        } else if (!filesToDelete.isEmpty()) {
-            // Just deleted some files, refresh playlist
-            stopPlaybackForRefresh();
-            ui.post(() -> toast("Removed " + filesToDelete.size() + " unassigned file(s)"));
-            return true; // Deletion only, considered success
         } else {
-            Log.d(TAG, "All content is up to date");
-            return true; // Already up to date
+            Log.d(TAG, "All content is up to date (reusing local files)");
+            return true;
         }
     }
 

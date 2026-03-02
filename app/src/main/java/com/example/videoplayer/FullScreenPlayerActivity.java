@@ -475,6 +475,7 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
             try {
                 if (!isOnline()) {
                     // Check if device was previously enrolled and has local content
+                    // BUT only if it wasn't explicitly deactivated
                     boolean wasEnrolled = getSharedPreferences(PREFS_NAME, MODE_PRIVATE).getBoolean(PREF_WAS_ENROLLED, false);
                     if (wasEnrolled && !isEnrolled) {
                         // Offline but was previously enrolled - play cached content
@@ -536,23 +537,7 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
                 } else if (responseCode == 404) {
                     // Device not found or deactivated - show enrollment screen
                     Log.d(TAG, "Device not enrolled or deactivated (404)");
-                    boolean wasEnrolled = isEnrolled;
-                    isEnrolled = false;
-                    // Persist unenrolled state
-                    getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit().putBoolean(PREF_WAS_ENROLLED, false).apply();
-                    ui.post(() -> {
-                        // Stop all playback if device was previously enrolled
-                        if (wasEnrolled) {
-                            Log.d(TAG, "Device was deactivated - stopping playback");
-                            stopAllPlayback();
-                        }
-                        // Stop poll handler so it doesn't restart playback
-                        pollHandler.removeCallbacksAndMessages(null);
-                        showEnrollmentOverlay(true);
-                        if (retryText != null) {
-                            retryText.setText("Device not enrolled. Checking again in 15 seconds...");
-                        }
-                    });
+                    handleDeviceDeactivated();
                 } else {
                     // Other error - keep checking
                     Log.d(TAG, "Enrollment check returned: " + responseCode);
@@ -571,6 +556,37 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
                 });
             }
         }).start();
+    }
+
+    /**
+     * Handle device deactivation - stop playback, clear cached enrolled state,
+     * and show enrollment screen. This is called when:
+     * - Device returns 404 (not found/deactivated)
+     * - Heartbeat returns is_active=false or company_expired=true
+     */
+    private void handleDeviceDeactivated() {
+        boolean wasEnrolled = isEnrolled;
+        isEnrolled = false;
+
+        // CRITICAL: Clear the enrolled flag so it NEVER plays cached content
+        // This ensures device stays on enrollment screen even after restart
+        getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
+                .putBoolean(PREF_WAS_ENROLLED, false)
+                .apply();
+
+        ui.post(() -> {
+            // Stop all playback if device was previously enrolled
+            if (wasEnrolled) {
+                Log.d(TAG, "Device was deactivated - stopping playback immediately");
+                stopAllPlayback();
+            }
+            // Stop poll handler so it doesn't restart playback
+            pollHandler.removeCallbacksAndMessages(null);
+            showEnrollmentOverlay(true);
+            if (retryText != null) {
+                retryText.setText("Device not enrolled. Checking again in 15 seconds...");
+            }
+        });
     }
 
     private void showEnrollmentOverlay(boolean show) {
@@ -1400,18 +1416,112 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
 
     private void sendOnlineHeartbeat() {
         if (!isEnrolled) return; // Don't send heartbeat if device is not enrolled
-        new Thread(() -> { try { postOnlineTrue(updateOnlineUrl(getAndroidId())); } catch (Exception ignored) {} }).start();
+        new Thread(() -> {
+            try {
+                boolean stillActive = postOnlineAndCheckStatus(updateOnlineUrl(getAndroidId()));
+                if (!stillActive) {
+                    // Device has been deactivated or company expired - show enrollment screen
+                    Log.d(TAG, "Heartbeat returned inactive - showing enrollment screen");
+                    isEnrolled = false;
+                    // Clear the enrolled flag so it doesn't play cached content
+                    getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
+                            .putBoolean(PREF_WAS_ENROLLED, false)
+                            .apply();
+                    ui.post(() -> {
+                        stopAllPlayback();
+                        pollHandler.removeCallbacksAndMessages(null);
+                        showEnrollmentOverlay(true);
+                        if (retryText != null) {
+                            retryText.setText("Device deactivated or subscription expired. Waiting for reactivation...");
+                        }
+                    });
+                }
+            } catch (Exception e) {
+                Log.e(TAG, "Heartbeat error: " + e.getMessage());
+            }
+        }).start();
     }
 
+    /**
+     * Post online status and check if device is still active.
+     * Returns true if device should continue playing, false if it should show enrollment screen.
+     */
+    private boolean postOnlineAndCheckStatus(String url) throws Exception {
+        HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
+        c.setConnectTimeout(CONNECT_TIMEOUT_MS);
+        c.setReadTimeout(READ_TIMEOUT_MS);
+        c.setRequestMethod("POST");
+        c.setDoOutput(true);
+        c.setRequestProperty("Content-Type", "application/json; charset=UTF-8");
+
+        try (DataOutputStream out = new DataOutputStream(c.getOutputStream())) {
+            out.write("{\"is_online\": true}".getBytes(StandardCharsets.UTF_8));
+        }
+
+        int responseCode = c.getResponseCode();
+
+        // 404 means device not found or deactivated
+        if (responseCode == 404) {
+            c.disconnect();
+            return false;
+        }
+
+        // For 200, parse the response to check is_active and company_expired
+        if (responseCode == 200) {
+            try (BufferedReader reader = new BufferedReader(new InputStreamReader(c.getInputStream()))) {
+                StringBuilder sb = new StringBuilder();
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    sb.append(line);
+                }
+                String response = sb.toString();
+
+                // Parse JSON response to check is_active and company_expired
+                JSONObject json = new JSONObject(response);
+
+                // Check if company expired
+                if (json.optBoolean("company_expired", false)) {
+                    Log.d(TAG, "Company subscription expired");
+                    c.disconnect();
+                    return false;
+                }
+
+                // Check if device is still active
+                if (!json.optBoolean("is_active", true)) {
+                    Log.d(TAG, "Device is not active");
+                    c.disconnect();
+                    return false;
+                }
+
+                // Check force_refresh flag - if true, device should stop and refresh
+                if (json.optBoolean("force_refresh", false)) {
+                    Log.d(TAG, "Force refresh flag is set");
+                    c.disconnect();
+                    return false;
+                }
+            }
+        }
+
+        c.disconnect();
+        return true;
+    }
+
+    /**
+     * Simple fire-and-forget online heartbeat (used during startup).
+     * For regular heartbeats, use sendOnlineHeartbeat() which checks the response.
+     */
     private void postOnlineTrue(String url) throws Exception {
         HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
-        c.setConnectTimeout(CONNECT_TIMEOUT_MS); c.setReadTimeout(READ_TIMEOUT_MS);
-        c.setRequestMethod("POST"); c.setDoOutput(true);
+        c.setConnectTimeout(CONNECT_TIMEOUT_MS);
+        c.setReadTimeout(READ_TIMEOUT_MS);
+        c.setRequestMethod("POST");
+        c.setDoOutput(true);
         c.setRequestProperty("Content-Type", "application/json; charset=UTF-8");
         try (DataOutputStream out = new DataOutputStream(c.getOutputStream())) {
             out.write("{\"is_online\": true}".getBytes(StandardCharsets.UTF_8));
         }
-        c.getResponseCode(); c.disconnect();
+        c.getResponseCode();
+        c.disconnect();
     }
 
     private void atomicSwapIntoMain(File main, File tmp) {

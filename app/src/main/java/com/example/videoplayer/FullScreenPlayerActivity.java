@@ -526,6 +526,11 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
                         // Persist enrolled state for offline recovery
                         getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit().putBoolean(PREF_WAS_ENROLLED, true).apply();
                         ui.post(() -> {
+                            // Reset all stale playback state so grid/video initializes fresh
+                            // (like an app restart). This fixes grid not updating after
+                            // deactivate -> reactivate without restarting the app.
+                            resetPlaybackState();
+
                             showEnrollmentOverlay(false);
                             // Restart poll handler for heartbeats and sync
                             pollHandler.removeCallbacksAndMessages(null);
@@ -591,6 +596,10 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
 
     private void showEnrollmentOverlay(boolean show) {
         if (enrollmentOverlay != null) {
+            // Ensure enrollment overlay is in the view hierarchy
+            if (show && enrollmentOverlay.getParent() == null) {
+                rootContainer.addView(enrollmentOverlay);
+            }
             enrollmentOverlay.setVisibility(show ? View.VISIBLE : View.GONE);
         }
         if (textureView != null) {
@@ -600,6 +609,101 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
         if (show && player != null) {
             player.stop();
         }
+    }
+
+    /**
+     * Fully reset all playback state so re-enrollment after deactivation
+     * starts completely fresh (equivalent to an app restart).
+     * Without this, stale flags/views prevent grid layout from updating.
+     */
+    private void resetPlaybackState() {
+        Log.d(TAG, "Resetting all playback state for fresh start after re-enrollment");
+
+        // 1) Reset working flags so startEverything() is not blocked
+        isWorking = false;
+        downloadInProgress = false;
+
+        // 2) Reset video state tracking so content detection works fresh
+        lastKnownVideoState = "";
+        lastKnownContentType = "";
+
+        // 3) Reset layout mode so it gets re-fetched from server
+        layoutMode = "single";
+        isGridMode = false;
+
+        // 4) Reset rotation tracking
+        lastAppliedRotation = -9999;
+        lastAppliedFitMode = "";
+
+        // 5) Clear metadata maps so they get re-fetched
+        metadataByVideoName = new HashMap<>();
+        metadataByFilename = new HashMap<>();
+
+        // 6) Clear playlists and image state
+        currentPlaylistFiles.clear();
+        currentImageFiles.clear();
+        currentImageIndex = 0;
+        isShowingImage = false;
+        imageTimerHandler.removeCallbacksAndMessages(null);
+
+        // 7) Release single player
+        if (player != null) {
+            try {
+                player.setVideoSurface(null);
+                player.stop();
+                player.clearMediaItems();
+                player.release();
+            } catch (Exception e) {
+                Log.e(TAG, "Error releasing player during reset: " + e.getMessage());
+            }
+            player = null;
+        }
+        if (surface != null) {
+            try { surface.release(); } catch (Exception ignored) {}
+            surface = null;
+        }
+
+        // 8) Release grid resources
+        releaseGridResources();
+
+        // 9) Reset grid video files tracking
+        for (int i = 0; i < gridVideoFiles.length; i++) {
+            gridVideoFiles[i] = null;
+            lastGridRotations[i] = 0;
+        }
+
+        // 10) Detach enrollment overlay before clearing rootContainer
+        //     (we need to keep it alive and re-add it)
+        if (enrollmentOverlay != null && enrollmentOverlay.getParent() != null) {
+            rootContainer.removeView(enrollmentOverlay);
+        }
+
+        // 11) Clear rootContainer and rebuild views fresh
+        rootContainer.removeAllViews();
+
+        // Re-add ImageView (behind video)
+        imageView = new ImageView(this);
+        imageView.setLayoutParams(new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT));
+        imageView.setScaleType(ImageView.ScaleType.FIT_CENTER);
+        imageView.setVisibility(View.GONE);
+        rootContainer.addView(imageView);
+
+        // Re-add single TextureView
+        textureView = new TextureView(this);
+        textureView.setSurfaceTextureListener(this);
+        FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT);
+        rootContainer.addView(textureView, params);
+
+        // Re-add enrollment overlay (so it can be shown/hidden later)
+        if (enrollmentOverlay != null) {
+            rootContainer.addView(enrollmentOverlay);
+        }
+
+        Log.d(TAG, "Playback state reset complete");
     }
 
     private void copyDeviceIdToClipboard() {
@@ -623,6 +727,7 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
 
     // ===== ROTATION POLLING =====
     private void pollRotationMetadata() {
+        if (!isEnrolled) return; // Don't poll when device is not enrolled
         new Thread(() -> {
             try {
                 if (!isOnline()) return;
@@ -2498,6 +2603,11 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
 
         // Small delay to allow surfaces to be released
         ui.postDelayed(() -> {
+            // Detach enrollment overlay before clearing (we'll re-add it)
+            if (enrollmentOverlay != null && enrollmentOverlay.getParent() != null) {
+                rootContainer.removeView(enrollmentOverlay);
+            }
+
             // Remove extra TextureViews from container
             rootContainer.removeAllViews();
 
@@ -2518,6 +2628,12 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
                     FrameLayout.LayoutParams.MATCH_PARENT
             );
             rootContainer.addView(textureView, params);
+
+            // Re-add enrollment overlay on top (hidden)
+            if (enrollmentOverlay != null && enrollmentOverlay.getParent() == null) {
+                enrollmentOverlay.setVisibility(View.GONE);
+                rootContainer.addView(enrollmentOverlay);
+            }
 
             // Re-initialize with mixed playlist after a small delay
             ui.postDelayed(() -> {
@@ -2568,6 +2684,11 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
 
         // Small delay to allow surfaces to be released
         ui.postDelayed(() -> {
+            // Detach enrollment overlay before clearing (we'll re-add it)
+            if (enrollmentOverlay != null && enrollmentOverlay.getParent() != null) {
+                rootContainer.removeView(enrollmentOverlay);
+            }
+
             // Remove current views
             rootContainer.removeAllViews();
 
@@ -2627,6 +2748,12 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
                     playGridVideos(mainDir, numSlots);
                 }
             }, 500);
+
+            // Re-add enrollment overlay on top (hidden) so it's not lost
+            if (enrollmentOverlay != null && enrollmentOverlay.getParent() == null) {
+                enrollmentOverlay.setVisibility(View.GONE);
+                rootContainer.addView(enrollmentOverlay);
+            }
         }, 50);
     }
 
@@ -2729,8 +2856,27 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
             return;
         }
 
+        // CRITICAL: Filter to only files that have metadata (i.e., are assigned to this device)
+        // Without this, old/unassigned files in the directory get gridPosition=0
+        // and take slot 0, pushing assigned files to wrong positions
+        List<File> assignedMedia = new ArrayList<>();
+        for (File f : allMedia) {
+            VideoMetadata vm = getMetadataForFile(f);
+            if (vm != null) {
+                assignedMedia.add(f);
+            } else {
+                Log.d(TAG, "Grid: skipping unassigned file: " + f.getName());
+            }
+        }
+
+        // Fall back to all media if no metadata available (e.g., offline with no cache)
+        if (assignedMedia.isEmpty()) {
+            Log.w(TAG, "No assigned media found, falling back to all media");
+            assignedMedia = allMedia;
+        }
+
         // Sort files by grid position from metadata
-        allMedia.sort((a, b) -> {
+        assignedMedia.sort((a, b) -> {
             VideoMetadata vmA = getMetadataForFile(a);
             VideoMetadata vmB = getMetadataForFile(b);
             int posA = vmA != null ? vmA.gridPosition : 0;
@@ -2738,7 +2884,17 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
             return Integer.compare(posA, posB);
         });
 
-        Log.d(TAG, "Playing " + Math.min(numSlots, allMedia.size()) + " media items in grid");
+        // Log the sorted order for debugging grid position issues
+        for (int i = 0; i < assignedMedia.size(); i++) {
+            File f = assignedMedia.get(i);
+            VideoMetadata vm = getMetadataForFile(f);
+            Log.d(TAG, "Grid sorted[" + i + "]: " + f.getName()
+                    + " gridPos=" + (vm != null ? vm.gridPosition : "null")
+                    + " videoName=" + (vm != null ? vm.videoName : "null")
+                    + " filename=" + (vm != null ? vm.filename : "null"));
+        }
+
+        Log.d(TAG, "Playing " + Math.min(numSlots, assignedMedia.size()) + " media items in grid");
 
         // Reset tracking arrays
         for (int i = 0; i < gridVideoFiles.length; i++) {
@@ -2747,9 +2903,9 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
         }
 
         // Create players/imageviews for each slot
-        for (int i = 0; i < numSlots && i < allMedia.size(); i++) {
+        for (int i = 0; i < numSlots && i < assignedMedia.size(); i++) {
             final int slotIndex = i;
-            File mediaFile = allMedia.get(i);
+            File mediaFile = assignedMedia.get(i);
             VideoMetadata vm = getMetadataForFile(mediaFile);
             int rotation = vm != null ? vm.rotation : 0;
             String fitMode = vm != null ? vm.fitMode : "cover";

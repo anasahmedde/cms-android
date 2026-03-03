@@ -180,6 +180,10 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
     private volatile boolean isWorking = false;
     private volatile boolean downloadInProgress = false;
 
+    // Playback generation counter: prevents duplicate players when multiple code paths
+    // trigger playMixedPlaylist simultaneously (causing dual audio + frozen video frames)
+    private int playbackGeneration = 0;
+
     // Storage management - report storage to server for dashboard visibility
     private static String storageReportUrl(String id) { return API_BASE + "/device/" + id + "/storage/report"; }
 
@@ -805,11 +809,17 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
                     try {
                         smartSyncVideos(mainDir, deviceId);
                         postUpdateStatusTrue(updateStatusUrl(deviceId));
+                        // CRITICAL: Use layoutMode (already updated above) instead of
+                        // isGridMode (which reflects the OLD state before layout change).
+                        // Previously, when layout changed from single→grid, isGridMode was
+                        // still false here, so it always called playMixedPlaylist (single mode)
+                        // and then returned — skipping the layoutChanged switch entirely.
+                        final String currentLayoutMode = layoutMode;
                         ui.post(() -> {
-                            if (isGridMode) {
-                                switchToGridMode();
-                            } else {
+                            if ("single".equals(currentLayoutMode) || currentLayoutMode == null) {
                                 playMixedPlaylist(mainDir);
+                            } else {
+                                switchToGridMode();
                             }
                         });
                     } catch (Exception e) {
@@ -1076,8 +1086,13 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
                 scaleY = scale * vh / viewHeight;
             } else if ("fill".equals(fitMode)) {
                 // Stretch to fill exactly (may distort aspect ratio)
-                scaleX = (float) viewHeight / vw;  // video width fills view height
-                scaleY = (float) viewWidth / vh;   // video height fills view width
+                // After 90/270 rotation, what was horizontal becomes vertical and vice versa.
+                // TextureView default stretches video to fill its bounds (viewWidth x viewHeight).
+                // After rotation, that becomes viewHeight x viewWidth.
+                // To make it fill viewWidth x viewHeight again, we must pre-scale so that
+                // the rotated result matches the view dimensions.
+                scaleX = (float) viewHeight / viewWidth;
+                scaleY = (float) viewWidth / viewHeight;
             } else {
                 // Cover (default) - fill screen, may crop
                 float scale = Math.max((float) viewWidth / rotatedVideoWidth, (float) viewHeight / rotatedVideoHeight);
@@ -1488,15 +1503,42 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
                     return;
                 }
                 String id = getAndroidId();
+
+                // Re-fetch layout metadata so layout changes are picked up
+                // even when download_status is already true
+                String previousLayoutMode = layoutMode;
+                boolean previousGridMode = isGridMode;
+                fetchLayoutModeAndMetadata(id);
+                boolean layoutChanged = !layoutMode.equals(previousLayoutMode);
+
+                // If layout changed but no download needed, switch mode now
+                if (layoutChanged && readDownloadStatus(readStatusUrl(id))) {
+                    Log.d(TAG, "Background check: layout changed " + previousLayoutMode + " -> " + layoutMode + " (no download needed)");
+                    final String newMode = layoutMode;
+                    ui.post(() -> {
+                        if ("single".equals(newMode) || newMode == null) {
+                            switchToSingleMode();
+                        } else {
+                            switchToGridMode();
+                        }
+                    });
+                    return;
+                }
+
                 if (!readDownloadStatus(readStatusUrl(id))) {
                     downloadInProgress = true;
                     try {
                         // Use smart sync instead of full re-download
                         boolean downloadSuccess = smartSyncVideos(mainDir, id);
 
-                        // Use mixed playlist to handle both videos and images
+                        // Use current layoutMode to decide playback mode
+                        final String currentLayoutMode = layoutMode;
                         ui.post(() -> {
-                            playMixedPlaylist(mainDir);
+                            if ("single".equals(currentLayoutMode) || currentLayoutMode == null) {
+                                playMixedPlaylist(mainDir);
+                            } else {
+                                switchToGridMode();
+                            }
 
                             // Update download status AFTER playback starts
                             if (downloadSuccess) {
@@ -1825,14 +1867,37 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
         return n.isEmpty() ? "video.mp4" : n.replaceAll("[\\\\/:*?\"<>|]", "_");
     }
 
-    private void playLocalPlaylistOrToast(File dir) {
-        List<File> files = listMp4(dir);
-        if (files.isEmpty()) { ui.post(() -> toast("No videos found")); return; }
-        currentPlaylistFiles = new ArrayList<>(files);
+    private void playLocalPlaylistOrToast(File dir, int thisGeneration) {
+        List<File> allFiles = listMp4(dir);
+        if (allFiles.isEmpty()) { ui.post(() -> toast("No videos found")); return; }
+
+        // Filter to only assigned videos (files with server metadata)
+        List<File> files = new ArrayList<>();
+        for (File f : allFiles) {
+            VideoMetadata vm = getMetadataForFile(f);
+            if (vm != null) {
+                files.add(f);
+            } else {
+                Log.d(TAG, "Playlist: skipping unassigned video: " + f.getName());
+            }
+        }
+
+        // Fall back to all files only if no metadata exists at all (offline, no cache)
+        if (files.isEmpty() && !metadataByFilename.isEmpty()) {
+            Log.d(TAG, "No assigned videos found. Nothing to play.");
+            ui.post(() -> toast("No assigned videos"));
+            return;
+        } else if (files.isEmpty()) {
+            Log.w(TAG, "No metadata available, falling back to all videos");
+            files = allFiles;
+        }
+
+        final List<File> playFiles = files;
+        currentPlaylistFiles = new ArrayList<>(playFiles);
 
         // Pre-load ALL video metadata into a map for instant access
         final Map<String, VideoMetadata> metadataCache = new HashMap<>();
-        for (File f : files) {
+        for (File f : playFiles) {
             VideoMetadata vm = getMetadataForFile(f);
             if (vm != null) {
                 metadataCache.put(f.getName().toLowerCase(), vm);
@@ -1840,13 +1905,20 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
         }
 
         // Get first video's rotation
-        VideoMetadata firstVm = metadataCache.get(files.get(0).getName().toLowerCase());
+        VideoMetadata firstVm = metadataCache.get(playFiles.get(0).getName().toLowerCase());
         int firstRotation = firstVm != null ? firstVm.rotation : 0;
         String firstFitMode = firstVm != null ? firstVm.fitMode : "cover";
         lastAppliedRotation = firstRotation;
         lastAppliedFitMode = firstFitMode;
 
         ui.post(() -> {
+            // CRITICAL: If a newer playback session was started while we were queued,
+            // bail out. This prevents two ExoPlayers from running simultaneously
+            // (which causes dual audio streams and frozen video from buffer contention).
+            if (thisGeneration != playbackGeneration) {
+                Log.d(TAG, "playLocalPlaylistOrToast: stale generation " + thisGeneration + " vs current " + playbackGeneration + ", skipping");
+                return;
+            }
             // IMPORTANT: Stop image slideshow if active and switch to video mode
             imageTimerHandler.removeCallbacksAndMessages(null);
             isShowingImage = false;
@@ -1859,11 +1931,18 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
 
             initPlayer();
             List<MediaItem> items = new ArrayList<>();
-            for (File f : files) if (f.exists() && f.length() > 0) items.add(MediaItem.fromUri(Uri.fromFile(f)));
+            for (File f : playFiles) if (f.exists() && f.length() > 0) items.add(MediaItem.fromUri(Uri.fromFile(f)));
             if (items.isEmpty()) { toast("No playable videos"); return; }
 
-            // CRITICAL: Start with alpha=0 to hide initial frame, apply transform, then fade in
-            textureView.setAlpha(0f);
+            // Start with near-invisible alpha to hide initial frame while rotation is applied,
+            // then fade in once video size is known.
+            // CRITICAL: Do NOT use 0f here. On Samsung/Qualcomm devices, alpha=0 causes the
+            // hardware compositor to skip compositing the TextureView entirely, which means
+            // updateTexImage() is never called on the SurfaceTexture. This starves the video
+            // decoder's BufferQueue (all slots dequeued, none acquired) causing permanent
+            // "waitForFreeSlotThenRelock: timeout" and frozen video. Using 0.01f keeps the
+            // compositor running while being effectively invisible.
+            textureView.setAlpha(0.01f);
             applyTextureViewTransform(firstRotation, firstFitMode);
 
             player.setMediaItems(items, true);
@@ -1943,7 +2022,7 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
 
                         // Fade out and pre-apply rotation when fade completes
                         textureView.animate()
-                                .alpha(0f)
+                                .alpha(0.01f)
                                 .setDuration(200)
                                 .withEndAction(() -> {
                                     applyTextureViewTransform(nextRotation, nextFitMode);
@@ -1970,7 +2049,7 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
         if (textureView == null) return;
 
         textureView.animate()
-                .alpha(0f)
+                .alpha(0.01f)
                 .setDuration(150)
                 .withEndAction(() -> {
                     applyTextureViewTransform(rotation, fitMode);
@@ -2126,6 +2205,10 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
      * Play a mixed playlist of videos and images
      */
     private void playMixedPlaylist(File dir) {
+        // Increment playback generation so any previously-queued playback lambdas bail out
+        final int thisGeneration = ++playbackGeneration;
+        Log.d(TAG, "playMixedPlaylist: generation " + thisGeneration);
+
         // Stop any existing playback first
         imageTimerHandler.removeCallbacksAndMessages(null);
         if (player != null) {
@@ -2137,14 +2220,49 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
             }
         }
 
+        // CRITICAL: Release any grid players that may still be playing audio
+        // in the background. When switching from grid → single, grid players
+        // were not being released here, causing multiple audio streams.
+        // NOTE: Only release if grid players still exist (they won't if we came
+        // from switchToSingleMode which already cleaned up everything).
+        if (isGridMode || gridPlayers[0] != null || gridPlayers[1] != null
+                || gridPlayers[2] != null || gridPlayers[3] != null) {
+            releaseGridResources();
+        }
+        isGridMode = false;
+
         List<File> allMedia = listAllMedia(dir);
         if (allMedia.isEmpty()) {
             toast("No media files found");
             return;
         }
 
+        // CRITICAL: Filter to only files that are assigned to this device (have server metadata).
+        // Without this, old/unassigned files left on disk get played too.
+        List<File> assignedMedia = new ArrayList<>();
+        for (File f : allMedia) {
+            VideoMetadata vm = getMetadataForFile(f);
+            if (vm != null) {
+                assignedMedia.add(f);
+            } else {
+                Log.d(TAG, "Single mode: skipping unassigned file: " + f.getName());
+            }
+        }
+
+        // Fall back to all media only if no metadata available at all (e.g., fully offline with no cache)
+        if (assignedMedia.isEmpty() && !metadataByFilename.isEmpty()) {
+            // We have metadata but no files matched - nothing assigned
+            Log.d(TAG, "No assigned media found, and metadata exists. Nothing to play.");
+            toast("No assigned content");
+            return;
+        } else if (assignedMedia.isEmpty()) {
+            // No metadata at all (offline, no cache) - fall back to all files
+            Log.w(TAG, "No metadata available, falling back to all media");
+            assignedMedia = allMedia;
+        }
+
         // Sort by grid position if available
-        allMedia.sort((a, b) -> {
+        assignedMedia.sort((a, b) -> {
             VideoMetadata vmA = getMetadataForFile(a);
             VideoMetadata vmB = getMetadataForFile(b);
             int posA = vmA != null ? vmA.gridPosition : 0;
@@ -2156,7 +2274,7 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
         List<File> videos = new ArrayList<>();
         List<File> images = new ArrayList<>();
 
-        for (File f : allMedia) {
+        for (File f : assignedMedia) {
             if (isVideoFile(f)) {
                 videos.add(f);
             } else if (isImageFile(f)) {
@@ -2172,7 +2290,7 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
         if (!videos.isEmpty() && images.isEmpty()) {
             // Only videos - play normally
             Log.d(TAG, "Playing videos only");
-            playLocalPlaylistOrToast(dir);
+            playLocalPlaylistOrToast(dir, thisGeneration);
         } else if (videos.isEmpty() && !images.isEmpty()) {
             // Only images - start image slideshow
             Log.d(TAG, "Playing images only");
@@ -2180,7 +2298,7 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
         } else if (!videos.isEmpty() && !images.isEmpty()) {
             // Mixed content - alternate between videos and images
             Log.d(TAG, "Playing mixed content");
-            playMixedContent(videos, images);
+            playMixedContent(videos, images, thisGeneration);
         } else {
             toast("No media files found");
         }
@@ -2239,7 +2357,7 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
      * Play mixed video and image content
      * This alternates between video playback and image display
      */
-    private void playMixedContent(List<File> videos, List<File> images) {
+    private void playMixedContent(List<File> videos, List<File> images, int thisGeneration) {
         // For now, play videos first, then show images
         // A more sophisticated approach would interleave based on grid_position
 
@@ -2247,6 +2365,12 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
             currentPlaylistFiles = videos;
 
             ui.post(() -> {
+                // Bail out if a newer playback session started
+                if (thisGeneration != playbackGeneration) {
+                    Log.d(TAG, "playMixedContent: stale generation " + thisGeneration + ", skipping");
+                    return;
+                }
+
                 // Hide image, show video
                 imageView.setVisibility(View.GONE);
                 textureView.setVisibility(View.VISIBLE);
@@ -2275,7 +2399,7 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
                 lastAppliedRotation = firstRotation;
                 lastAppliedFitMode = firstFitMode;
 
-                textureView.setAlpha(0f);
+                textureView.setAlpha(0.01f);
                 applyTextureViewTransform(firstRotation, firstFitMode);
 
                 player.setMediaItems(items, true);
@@ -2384,27 +2508,19 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
     }
 
     private void initPlayer() {
-        // Release existing player if it's in a stopped/error state
+        // ALWAYS release old player to prevent listener stacking and audio leaks.
+        // Previously, if player was in STATE_READY/STATE_BUFFERING, it was reused
+        // without clearing listeners, causing duplicate audio and transition handlers.
         if (player != null) {
             try {
-                // Check if player needs to be recreated
-                if (player.getPlaybackState() == Player.STATE_IDLE ||
-                        player.getPlaybackState() == Player.STATE_ENDED) {
-                    Log.d(TAG, "Releasing old player in state: " + player.getPlaybackState());
-                    player.setVideoSurface(null);
-                    player.release();
-                    player = null;
-                } else {
-                    // Player is still usable, just return
-                    return;
-                }
+                player.setVideoSurface(null);
+                player.stop();
+                player.clearMediaItems();
+                player.release();
             } catch (Exception e) {
-                Log.e(TAG, "Error checking player state: " + e.getMessage());
-                try {
-                    player.release();
-                } catch (Exception ignored) {}
-                player = null;
+                Log.e(TAG, "Error releasing old player: " + e.getMessage());
             }
+            player = null;
         }
 
         Log.d(TAG, "Creating new ExoPlayer");
@@ -2598,19 +2714,95 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
         Log.d(TAG, "Switching to SINGLE mode");
         isGridMode = false;
 
-        // Release all grid resources
-        releaseGridResources();
+        // Cancel any pending playback lambdas
+        playbackGeneration++;
 
-        // Small delay to allow surfaces to be released
-        ui.postDelayed(() -> {
-            // Detach enrollment overlay before clearing (we'll re-add it)
-            if (enrollmentOverlay != null && enrollmentOverlay.getParent() != null) {
-                rootContainer.removeView(enrollmentOverlay);
+        // Stop image slideshow
+        imageTimerHandler.removeCallbacksAndMessages(null);
+        isShowingImage = false;
+
+        // ── Step 1: Detach surfaces from ALL codecs BEFORE releasing players ──
+        // This tells the hardware codec to disconnect from the BufferQueue.
+        // Without this, the Qualcomm codec keeps its BufferQueue producer reference
+        // even after ExoPlayer.release(), causing "waitForFreeSlotThenRelock: timeout"
+        // on the old SurfaceTexture when the new player starts.
+        for (int i = 0; i < gridPlayers.length; i++) {
+            if (gridPlayers[i] != null) {
+                try {
+                    gridPlayers[i].setVideoSurface(null);
+                } catch (Exception ignored) {}
             }
+        }
+        if (player != null) {
+            try {
+                player.setVideoSurface(null);
+            } catch (Exception ignored) {}
+        }
 
-            // Remove extra TextureViews from container
-            rootContainer.removeAllViews();
+        // ── Step 2: Release the old Surface objects ──
+        // These are wrappers around the SurfaceTexture's BufferQueue producer.
+        // Releasing them signals the BufferQueue that the producer is gone.
+        if (surface != null) {
+            try { surface.release(); } catch (Exception ignored) {}
+            surface = null;
+        }
+        for (int i = 0; i < gridSurfaces.length; i++) {
+            if (gridSurfaces[i] != null) {
+                try { gridSurfaces[i].release(); } catch (Exception ignored) {}
+                gridSurfaces[i] = null;
+            }
+        }
 
+        // ── Step 3: Remove all views from container ──
+        // This detaches the grid TextureViews which triggers onSurfaceTextureDestroyed
+        // on each one, releasing their SurfaceTextures and clearing the BufferQueues.
+        if (enrollmentOverlay != null && enrollmentOverlay.getParent() != null) {
+            rootContainer.removeView(enrollmentOverlay);
+        }
+        rootContainer.removeAllViews();
+
+        // ── Step 4: NOW release the ExoPlayers (and their MediaCodec instances) ──
+        // At this point all surfaces and SurfaceTextures are gone, so the hardware
+        // codec has nothing to hold onto.
+        for (int i = 0; i < gridPlayers.length; i++) {
+            if (gridPlayers[i] != null) {
+                try {
+                    gridPlayers[i].stop();
+                    gridPlayers[i].clearMediaItems();
+                    gridPlayers[i].release();
+                } catch (Exception e) {
+                    Log.e(TAG, "Error releasing grid player " + i + ": " + e.getMessage());
+                }
+                gridPlayers[i] = null;
+            }
+            gridTextureViews[i] = null;
+            if (gridImageViews[i] != null) {
+                try { gridImageViews[i].setImageBitmap(null); } catch (Exception ignored) {}
+                gridImageViews[i] = null;
+            }
+        }
+        for (int i = 0; i < gridVideoFiles.length; i++) {
+            gridVideoFiles[i] = null;
+            lastGridRotations[i] = 0;
+        }
+        if (player != null) {
+            try {
+                player.stop();
+                player.clearMediaItems();
+                player.release();
+            } catch (Exception e) {
+                Log.e(TAG, "Error releasing single player: " + e.getMessage());
+            }
+            player = null;
+        }
+
+        // ── Step 5: Wait for hardware codec to fully release ──
+        // Qualcomm's c2.qti.avc.decoder needs time to tear down its internal
+        // BufferQueue producer after the Surface and MediaCodec are released.
+        // 300ms is enough for the decoder to be returned to the pool.
+        // THEN create the new TextureView — its onSurfaceTextureAvailable will
+        // create a fresh Surface and a new ExoPlayer with a clean codec instance.
+        ui.postDelayed(() -> {
             // Re-add ImageView first (behind video)
             imageView = new ImageView(this);
             imageView.setLayoutParams(new FrameLayout.LayoutParams(
@@ -2620,9 +2812,37 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
             imageView.setVisibility(View.GONE);
             rootContainer.addView(imageView);
 
-            // Re-add single textureView
+            // Re-add single textureView — when its surface becomes available,
+            // onSurfaceTextureAvailable() will set `surface` and start playback
             textureView = new TextureView(this);
-            textureView.setSurfaceTextureListener(this);
+            textureView.setSurfaceTextureListener(new TextureView.SurfaceTextureListener() {
+                @Override
+                public void onSurfaceTextureAvailable(SurfaceTexture st, int w, int h) {
+                    Log.d(TAG, "Single mode: new surface available " + w + "x" + h);
+                    surface = new Surface(st);
+                    // Surface is ready — NOW start playback
+                    File mainDir = ensureMainDir();
+                    playMixedPlaylist(mainDir);
+                }
+                @Override
+                public void onSurfaceTextureSizeChanged(SurfaceTexture st, int w, int h) {
+                    Log.d(TAG, "SurfaceTexture size changed: " + w + "x" + h);
+                }
+                @Override
+                public boolean onSurfaceTextureDestroyed(SurfaceTexture st) {
+                    Log.d(TAG, "SurfaceTexture destroyed");
+                    if (player != null) {
+                        player.setVideoSurface(null);
+                    }
+                    if (surface != null) {
+                        surface.release();
+                        surface = null;
+                    }
+                    return true;
+                }
+                @Override
+                public void onSurfaceTextureUpdated(SurfaceTexture st) {}
+            });
             FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(
                     FrameLayout.LayoutParams.MATCH_PARENT,
                     FrameLayout.LayoutParams.MATCH_PARENT
@@ -2635,17 +2855,20 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
                 rootContainer.addView(enrollmentOverlay);
             }
 
-            // Re-initialize with mixed playlist after a small delay
-            ui.postDelayed(() -> {
-                File mainDir = ensureMainDir();
-                playMixedPlaylist(mainDir);
-            }, 100);
-        }, 50);
+            // NO playMixedPlaylist here — it will be called when surface is ready
+        }, 300);
     }
 
     private void switchToGridMode() {
         Log.d(TAG, "Switching to GRID mode: " + layoutMode);
         isGridMode = true;
+
+        // Cancel any pending single-mode playback lambdas
+        playbackGeneration++;
+
+        // Stop image slideshow if running
+        imageTimerHandler.removeCallbacksAndMessages(null);
+        isShowingImage = false;
 
         // Stop single player first - detach surface before stopping
         if (player != null) {
@@ -3018,17 +3241,33 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
             float centerX = viewWidth / 2f;
             float centerY = viewHeight / 2f;
 
-            // For grid mode, we typically want to cover the slot
-            // Apply rotation around center
-            matrix.postRotate(rotation, centerX, centerY);
-
-            // Scale to cover if rotated 90 or 270
-            if (rotation == 90 || rotation == 270) {
-                float scale = Math.max((float) viewWidth / viewHeight, (float) viewHeight / viewWidth);
-                matrix.postScale(scale, scale, centerX, centerY);
+            if ("fill".equals(fitMode)) {
+                // Fill: stretch to cover entire slot after rotation
+                if (rotation == 90 || rotation == 270) {
+                    float scaleX = (float) viewHeight / viewWidth;
+                    float scaleY = (float) viewWidth / viewHeight;
+                    matrix.setScale(scaleX, scaleY, centerX, centerY);
+                }
+                // For 0/180, identity scale is correct (TextureView fills its bounds by default)
+                matrix.postRotate(rotation, centerX, centerY);
+            } else if ("contain".equals(fitMode)) {
+                // Contain: fit inside slot, may have bars
+                if (rotation == 90 || rotation == 270) {
+                    float scale = Math.min((float) viewWidth / viewHeight, (float) viewHeight / viewWidth);
+                    matrix.setScale(scale, scale, centerX, centerY);
+                }
+                matrix.postRotate(rotation, centerX, centerY);
+            } else {
+                // Cover (default): fill slot, may crop
+                matrix.postRotate(rotation, centerX, centerY);
+                if (rotation == 90 || rotation == 270) {
+                    float scale = Math.max((float) viewWidth / viewHeight, (float) viewHeight / viewWidth);
+                    matrix.postScale(scale, scale, centerX, centerY);
+                }
             }
 
             tv.setTransform(matrix);
+            Log.d(TAG, "Grid slot " + slotIndex + " transform: rotation=" + rotation + " fitMode=" + fitMode);
         });
     }
 }

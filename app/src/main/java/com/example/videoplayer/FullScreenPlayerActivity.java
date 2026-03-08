@@ -819,17 +819,28 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
                     try {
                         smartSyncVideos(mainDir, deviceId);
                         postUpdateStatusTrue(updateStatusUrl(deviceId));
-                        // CRITICAL: Use layoutMode (already updated above) instead of
-                        // isGridMode (which reflects the OLD state before layout change).
-                        // Previously, when layout changed from single→grid, isGridMode was
-                        // still false here, so it always called playMixedPlaylist (single mode)
-                        // and then returned — skipping the layoutChanged switch entirely.
+                        // After sync, apply the correct mode.
+                        // If the layout also changed (e.g. grid→single), we MUST call the
+                        // switch function to tear down the old views/codecs first.
+                        // Calling playMixedPlaylist() directly while grid players still hold
+                        // their BufferQueues causes "waitForFreeSlotThenRelock: timeout".
                         final String currentLayoutMode = layoutMode;
+                        final boolean layoutAlsoChanged = layoutChanged;
                         ui.post(() -> {
-                            if ("single".equals(currentLayoutMode) || currentLayoutMode == null) {
-                                playMixedPlaylist(mainDir);
+                            if (layoutAlsoChanged) {
+                                // Layout changed during the sync window — do a proper switch
+                                if ("single".equals(currentLayoutMode) || currentLayoutMode == null) {
+                                    switchToSingleMode();
+                                } else {
+                                    switchToGridMode();
+                                }
                             } else {
-                                switchToGridMode();
+                                // Same layout, just refresh content
+                                if ("single".equals(currentLayoutMode) || currentLayoutMode == null) {
+                                    playMixedPlaylist(mainDir);
+                                } else {
+                                    switchToGridMode();
+                                }
                             }
                         });
                     } catch (Exception e) {

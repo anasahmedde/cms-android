@@ -186,6 +186,13 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
     // trigger playMixedPlaylist simultaneously (causing dual audio + frozen video frames)
     private int playbackGeneration = 0;
 
+    // Transition watcher: class-level handler so it can be cancelled before each new
+    // playback session. Without this, every playLocalPlaylistOrToast call leaked a new
+    // Handler+Runnable that kept fading the TextureView to 0.01f, fighting the fade-in
+    // from onVideoSizeChanged and causing a permanently frozen/invisible screen.
+    private final Handler transitionWatcherHandler = new Handler(Looper.getMainLooper());
+    private int transitionWatcherGeneration = 0;
+
     // Storage management - report storage to server for dashboard visibility
     private static String storageReportUrl(String id) { return API_BASE + "/device/" + id + "/storage/report"; }
 
@@ -381,7 +388,8 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
         rotationPollHandler.removeCallbacksAndMessages(null);
         tempHandler.removeCallbacksAndMessages(null);
         enrollmentCheckHandler.removeCallbacksAndMessages(null);
-        imageTimerHandler.removeCallbacksAndMessages(null);  // Stop image slideshow
+        imageTimerHandler.removeCallbacksAndMessages(null);
+        transitionWatcherHandler.removeCallbacksAndMessages(null);
         btShouldReconnect = false;
         stopBleScan();
         if (btGatt != null) { try { btGatt.close(); } catch (Exception ignored) {} }
@@ -2000,10 +2008,19 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
 
     // Watch for upcoming video transitions and fade out before they happen
     private void startTransitionWatcher(final Map<String, VideoMetadata> metadataCache) {
-        final Handler transitionHandler = new Handler(Looper.getMainLooper());
+        // Cancel any previously-running watcher and bump the generation so stale
+        // Runnables self-terminate. Without this, every playLocalPlaylistOrToast call
+        // leaked a new Handler that kept fading textureView to 0.01f, racing against
+        // onVideoSizeChanged's fade-in and leaving the screen permanently invisible.
+        transitionWatcherHandler.removeCallbacksAndMessages(null);
+        final int myGeneration = ++transitionWatcherGeneration;
+
         final Runnable transitionChecker = new Runnable() {
             @Override
             public void run() {
+                // Stop if a newer playback session has started
+                if (myGeneration != transitionWatcherGeneration) return;
+
                 if (player == null || currentPlaylistFiles == null || currentPlaylistFiles.size() <= 1) {
                     return;
                 }
@@ -2036,14 +2053,14 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
                 }
 
                 // Keep checking while playing
-                if (player != null && player.isPlaying()) {
-                    transitionHandler.postDelayed(this, 50);
+                if (myGeneration == transitionWatcherGeneration && player != null && player.isPlaying()) {
+                    transitionWatcherHandler.postDelayed(this, 50);
                 }
             }
         };
 
         // Start checking after playback begins
-        transitionHandler.postDelayed(transitionChecker, 500);
+        transitionWatcherHandler.postDelayed(transitionChecker, 500);
     }
 
     // Smooth fade transition when changing rotation (kept for manual triggers)

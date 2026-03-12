@@ -106,7 +106,9 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
     // ==========================================
     // BACKEND URL CONFIGURATION - CHANGE THIS
     // ==========================================
-    private static final String API_BASE = "https://api-staging-cms.wizioners.com";
+    // private static final String API_BASE = "https://api-cms.wizioners.com";
+     private static final String API_BASE = "https://api-staging-cms.wizioners.com";
+
     // ==========================================
 
     // Network timeouts (milliseconds)
@@ -817,17 +819,28 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
                     try {
                         smartSyncVideos(mainDir, deviceId);
                         postUpdateStatusTrue(updateStatusUrl(deviceId));
-                        // CRITICAL: Use layoutMode (already updated above) instead of
-                        // isGridMode (which reflects the OLD state before layout change).
-                        // Previously, when layout changed from single→grid, isGridMode was
-                        // still false here, so it always called playMixedPlaylist (single mode)
-                        // and then returned — skipping the layoutChanged switch entirely.
+                        // After sync, apply the correct mode.
+                        // If the layout also changed (e.g. grid→single), we MUST call the
+                        // switch function to tear down the old views/codecs first.
+                        // Calling playMixedPlaylist() directly while grid players still hold
+                        // their BufferQueues causes "waitForFreeSlotThenRelock: timeout".
                         final String currentLayoutMode = layoutMode;
+                        final boolean layoutAlsoChanged = layoutChanged;
                         ui.post(() -> {
-                            if ("single".equals(currentLayoutMode) || currentLayoutMode == null) {
-                                playMixedPlaylist(mainDir);
+                            if (layoutAlsoChanged) {
+                                // Layout changed during the sync window — do a proper switch
+                                if ("single".equals(currentLayoutMode) || currentLayoutMode == null) {
+                                    switchToSingleMode();
+                                } else {
+                                    switchToGridMode();
+                                }
                             } else {
-                                switchToGridMode();
+                                // Same layout, just refresh content
+                                if ("single".equals(currentLayoutMode) || currentLayoutMode == null) {
+                                    playMixedPlaylist(mainDir);
+                                } else {
+                                    switchToGridMode();
+                                }
                             }
                         });
                     } catch (Exception e) {
@@ -3142,33 +3155,41 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
             lastGridRotations[i] = 0;
         }
 
-        // Create players/imageviews for each slot
-        for (int i = 0; i < numSlots && i < assignedMedia.size(); i++) {
-            final int slotIndex = i;
+        // Create players/imageviews for each slot.
+        // Use gridPosition (1-based) as the target slot index so videos land in
+        // the correct slot even when some slots are intentionally empty.
+        for (int i = 0; i < assignedMedia.size(); i++) {
             File mediaFile = assignedMedia.get(i);
             VideoMetadata vm = getMetadataForFile(mediaFile);
+
+            // Determine target slot: gridPosition is 1-based, slot index is 0-based.
+            // Fall back to array index if gridPosition is 0 or missing.
+            int rawPos = vm != null ? vm.gridPosition : 0;
+            final int slotIndex = (rawPos > 0 && rawPos <= numSlots) ? rawPos - 1 : i;
+            if (slotIndex >= numSlots) continue; // safety guard
+
             int rotation = vm != null ? vm.rotation : 0;
             String fitMode = vm != null ? vm.fitMode : "cover";
             String contentType = vm != null ? vm.contentType : (isImageFile(mediaFile) ? "image" : "video");
 
-            // Track file and rotation for live updates
-            gridVideoFiles[i] = mediaFile;
-            lastGridRotations[i] = rotation;
+            // Track file and rotation for live updates using the correct slot index
+            gridVideoFiles[slotIndex] = mediaFile;
+            lastGridRotations[slotIndex] = rotation;
 
             if ("image".equals(contentType) || isImageFile(mediaFile)) {
                 // Handle image slot
-                Log.d(TAG, "Grid slot " + i + " is IMAGE: " + mediaFile.getName());
+                Log.d(TAG, "Grid slot " + slotIndex + " is IMAGE: " + mediaFile.getName());
 
                 // Hide TextureView, create and show ImageView for this slot
-                if (gridTextureViews[i] != null) {
-                    gridTextureViews[i].setVisibility(View.GONE);
+                if (gridTextureViews[slotIndex] != null) {
+                    gridTextureViews[slotIndex].setVisibility(View.GONE);
                 }
 
                 // Create ImageView for this slot if not already created
-                if (gridImageViews[i] == null) {
-                    gridImageViews[i] = new ImageView(this);
-                    FrameLayout.LayoutParams params = getGridLayoutParams(layoutMode, i, numSlots);
-                    rootContainer.addView(gridImageViews[i], params);
+                if (gridImageViews[slotIndex] == null) {
+                    gridImageViews[slotIndex] = new ImageView(this);
+                    FrameLayout.LayoutParams params = getGridLayoutParams(layoutMode, slotIndex, numSlots);
+                    rootContainer.addView(gridImageViews[slotIndex], params);
                 }
 
                 // Load and display image
@@ -3200,47 +3221,47 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
                                 break;
                         }
 
-                        gridImageViews[i].setScaleType(scaleType);
-                        gridImageViews[i].setImageBitmap(bitmap);
-                        gridImageViews[i].setVisibility(View.VISIBLE);
+                        gridImageViews[slotIndex].setScaleType(scaleType);
+                        gridImageViews[slotIndex].setImageBitmap(bitmap);
+                        gridImageViews[slotIndex].setVisibility(View.VISIBLE);
 
-                        Log.d(TAG, "Grid slot " + i + ": " + mediaFile.getName() + " (image) rotation=" + rotation);
+                        Log.d(TAG, "Grid slot " + slotIndex + ": " + mediaFile.getName() + " (image) rotation=" + rotation);
                     }
                 } catch (Exception e) {
-                    Log.e(TAG, "Failed to load image for grid slot " + i + ": " + e.getMessage());
+                    Log.e(TAG, "Failed to load image for grid slot " + slotIndex + ": " + e.getMessage());
                 }
             } else {
-                // Handle video slot (existing code)
-                Log.d(TAG, "Grid slot " + i + " is VIDEO: " + mediaFile.getName());
+                // Handle video slot
+                Log.d(TAG, "Grid slot " + slotIndex + " is VIDEO: " + mediaFile.getName());
 
                 // Make sure TextureView is visible
-                if (gridTextureViews[i] != null) {
-                    gridTextureViews[i].setVisibility(View.VISIBLE);
+                if (gridTextureViews[slotIndex] != null) {
+                    gridTextureViews[slotIndex].setVisibility(View.VISIBLE);
                 }
 
                 // Hide ImageView if it exists
-                if (gridImageViews[i] != null) {
-                    gridImageViews[i].setVisibility(View.GONE);
+                if (gridImageViews[slotIndex] != null) {
+                    gridImageViews[slotIndex].setVisibility(View.GONE);
                 }
 
-                gridPlayers[i] = new ExoPlayer.Builder(this).build();
-                gridPlayers[i].setRepeatMode(Player.REPEAT_MODE_ONE); // Loop each video
+                gridPlayers[slotIndex] = new ExoPlayer.Builder(this).build();
+                gridPlayers[slotIndex].setRepeatMode(Player.REPEAT_MODE_ONE);
 
-                if (gridSurfaces[i] != null) {
-                    gridPlayers[i].setVideoSurface(gridSurfaces[i]);
+                if (gridSurfaces[slotIndex] != null) {
+                    gridPlayers[slotIndex].setVideoSurface(gridSurfaces[slotIndex]);
                 }
 
                 // Apply rotation transform to TextureView
-                if (gridTextureViews[i] != null) {
-                    applyGridTextureViewTransform(gridTextureViews[i], rotation, fitMode, slotIndex);
+                if (gridTextureViews[slotIndex] != null) {
+                    applyGridTextureViewTransform(gridTextureViews[slotIndex], rotation, fitMode, slotIndex);
                 }
 
                 MediaItem item = MediaItem.fromUri(Uri.fromFile(mediaFile));
-                gridPlayers[i].setMediaItem(item);
-                gridPlayers[i].prepare();
-                gridPlayers[i].play();
+                gridPlayers[slotIndex].setMediaItem(item);
+                gridPlayers[slotIndex].prepare();
+                gridPlayers[slotIndex].play();
 
-                Log.d(TAG, "Grid slot " + i + ": " + mediaFile.getName() + " (video) rotation=" + rotation);
+                Log.d(TAG, "Grid slot " + slotIndex + ": " + mediaFile.getName() + " (video) rotation=" + rotation);
             }
         }
     }

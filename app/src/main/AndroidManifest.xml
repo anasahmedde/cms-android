@@ -38,9 +38,20 @@
         android:name="android.permission.BLUETOOTH_CONNECT"
         tools:targetApi="s" />
 
+    <!-- Android TV: Declare that touch screen is NOT required (TVs don't have touch) -->
+    <uses-feature
+        android:name="android.hardware.touchscreen"
+        android:required="false" />
+
+    <!-- Android TV: Declare Leanback support (optional but recommended) -->
+    <uses-feature
+        android:name="android.software.leanback"
+        android:required="false" />
+
     <application
         android:icon="@mipmap/ic_launcher"
         android:roundIcon="@mipmap/ic_launcher_round"
+        android:banner="@mipmap/ic_launcher"
         android:label="DGX Player"
         android:allowBackup="true"
         android:supportsRtl="true"
@@ -48,14 +59,17 @@
         android:requestLegacyExternalStorage="true"
         android:theme="@style/Theme.AppCompat.Light.NoActionBar">
 
-        <!-- BLE test screen as launcher -->
+        <!-- Main activity with sensor-based orientation for TV/mobile compatibility -->
         <activity
             android:name=".FullScreenPlayerActivity"
             android:exported="true"
-            android:screenOrientation="portrait">
+            android:screenOrientation="fullSensor"
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
+                <!-- Add Leanback launcher category for Android TV home screen -->
+                <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
             </intent-filter>
         </activity>
 

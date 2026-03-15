@@ -39,6 +39,8 @@ import android.bluetooth.le.ScanResult;
 import android.bluetooth.le.ScanSettings;
 import android.content.Intent;
 import android.content.pm.PackageManager;
+import android.content.res.Configuration;
+import android.app.UiModeManager;
 import android.graphics.Matrix;
 import android.graphics.SurfaceTexture;
 import android.media.MediaScannerConnection;
@@ -107,14 +109,16 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
     // BACKEND URL CONFIGURATION - CHANGE THIS
     // ==========================================
     // private static final String API_BASE = "https://api-cms.wizioners.com";
-     private static final String API_BASE = "https://api-staging-cms.wizioners.com";
+    private static final String API_BASE = "https://api-staging-cms.wizioners.com";
 
     // ==========================================
 
     // Network timeouts (milliseconds)
-    private static final int CONNECT_TIMEOUT_MS = 15_000;
-    private static final int READ_TIMEOUT_MS = 30_000;
-    private static final int DOWNLOAD_TIMEOUT_MS = 120_000;
+    private static final int CONNECT_TIMEOUT_MS = 30_000;   // 30 seconds for connection
+    private static final int READ_TIMEOUT_MS = 60_000;      // 60 seconds for reading
+    private static final int DOWNLOAD_TIMEOUT_MS = 600_000; // 10 minutes for large file downloads
+    private static final long MIN_STORAGE_REQUIRED_MB = 100; // Minimum 100MB free space required
+    private static final long MIN_RAM_REQUIRED_MB = 50;      // Minimum 50MB RAM required
 
     private static String listDownloadsUrl(String id) { return API_BASE + "/device/" + id + "/videos/downloads"; }
     private static String readStatusUrl(String id) { return API_BASE + "/device/" + id + "/download_status"; }
@@ -200,6 +204,9 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
     private int screenWidth = 0;
     private int screenHeight = 0;
 
+    // TV detection - Android TV has limited hardware video decoders
+    private boolean isTvDevice = false;
+
     // Video dimensions
     private int videoWidth = 0;
     private int videoHeight = 0;
@@ -273,6 +280,12 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
         super.onCreate(savedInstanceState);
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         setContentView(R.layout.activity_fullscreen_player);
+
+        // Detect if running on Android TV
+        UiModeManager uiModeManager = (UiModeManager) getSystemService(UI_MODE_SERVICE);
+        isTvDevice = (uiModeManager != null &&
+                uiModeManager.getCurrentModeType() == Configuration.UI_MODE_TYPE_TELEVISION);
+        Log.d(TAG, "Device type: " + (isTvDevice ? "Android TV" : "Mobile"));
 
         // Get screen dimensions
         DisplayMetrics dm = new DisplayMetrics();
@@ -425,6 +438,8 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
         }
         // Release grid resources
         releaseGridResources();
+        // Stop TV time-sharing rotation
+        stopTvRotation();
         // Clear image view bitmap
         if (imageView != null) {
             try {
@@ -1350,13 +1365,13 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
     }
 
     /**
-     * Reports device storage capacity and usage to the server.
+     * Reports device storage capacity, usage, and RAM to the server.
      * Called on startup and after downloads for dashboard visibility.
      */
     private void reportStorageToServer() {
         new Thread(() -> {
             try {
-                File storageDir = getExternalFilesDir(null);
+                File storageDir = ensureMainDir();
                 if (storageDir == null) return;
 
                 // Get storage statistics
@@ -1366,7 +1381,21 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
                 long usedBytes = totalBytes - availableBytes;
 
                 // Calculate content storage (files in our app directory)
-                long contentBytes = calculateContentSize(ensureMainDir());
+                long contentBytes = calculateContentSize(storageDir);
+
+                // Get RAM info
+                Runtime runtime = Runtime.getRuntime();
+                long maxMemory = runtime.maxMemory();
+                long usedMemory = runtime.totalMemory() - runtime.freeMemory();
+                long availableMemory = maxMemory - usedMemory;
+
+                // Get system memory info
+                android.app.ActivityManager activityManager =
+                        (android.app.ActivityManager) getSystemService(ACTIVITY_SERVICE);
+                android.app.ActivityManager.MemoryInfo memInfo = new android.app.ActivityManager.MemoryInfo();
+                if (activityManager != null) {
+                    activityManager.getMemoryInfo(memInfo);
+                }
 
                 String url = storageReportUrl(getAndroidId());
                 HttpURLConnection conn = (HttpURLConnection) new URL(url).openConnection();
@@ -1376,9 +1405,23 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
                 conn.setConnectTimeout(10000);
 
                 JSONObject body = new JSONObject();
+                // Storage info
                 body.put("total_bytes", totalBytes);
+                body.put("available_bytes", availableBytes);
                 body.put("used_bytes", usedBytes);
                 body.put("content_bytes", contentBytes);
+                body.put("storage_percent_used", (int)((usedBytes * 100) / totalBytes));
+
+                // RAM info
+                body.put("ram_total_bytes", maxMemory);
+                body.put("ram_available_bytes", availableMemory);
+                body.put("ram_used_bytes", usedMemory);
+                body.put("system_ram_total", memInfo.totalMem);
+                body.put("system_ram_available", memInfo.availMem);
+                body.put("low_memory", memInfo.lowMemory);
+
+                // Device type
+                body.put("is_tv", isTvDevice);
 
                 try (DataOutputStream out = new DataOutputStream(conn.getOutputStream())) {
                     out.writeBytes(body.toString());
@@ -1386,8 +1429,11 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
 
                 int responseCode = conn.getResponseCode();
                 if (responseCode == 200) {
-                    Log.d(TAG, String.format("Storage reported: total=%d, used=%d, content=%d",
-                            totalBytes, usedBytes, contentBytes));
+                    Log.d(TAG, String.format("Storage reported: total=%dMB, available=%dMB, content=%dMB, RAM=%dMB/%dMB",
+                            totalBytes/1024/1024, availableBytes/1024/1024, contentBytes/1024/1024,
+                            availableMemory/1024/1024, maxMemory/1024/1024));
+                } else {
+                    Log.w(TAG, "Storage report failed with code: " + responseCode);
                 }
 
                 conn.disconnect();
@@ -1415,6 +1461,119 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
             }
         }
         return size;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // STORAGE AND RAM CHECKS - Verify before download
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    private static class StorageCheckResult {
+        boolean canDownload;
+        String message;
+        long availableMB;
+        long totalMB;
+
+        StorageCheckResult(boolean canDownload, String message, long availableMB, long totalMB) {
+            this.canDownload = canDownload;
+            this.message = message;
+            this.availableMB = availableMB;
+            this.totalMB = totalMB;
+        }
+    }
+
+    private static class RamCheckResult {
+        boolean canProceed;
+        String message;
+        long availableMB;
+        long totalMB;
+
+        RamCheckResult(boolean canProceed, String message, long availableMB, long totalMB) {
+            this.canProceed = canProceed;
+            this.message = message;
+            this.availableMB = availableMB;
+            this.totalMB = totalMB;
+        }
+    }
+
+    /**
+     * Check if device has enough storage space before downloading.
+     */
+    private StorageCheckResult checkStorageBeforeDownload(int fileCount) {
+        try {
+            File storageDir = ensureMainDir();
+            StatFs stat = new StatFs(storageDir.getPath());
+
+            long availableBytes = stat.getAvailableBytes();
+            long totalBytes = stat.getTotalBytes();
+            long availableMB = availableBytes / (1024 * 1024);
+            long totalMB = totalBytes / (1024 * 1024);
+
+            // Estimate space needed (assume average 50MB per file for videos)
+            long estimatedNeededMB = fileCount * 50;
+
+            Log.d(TAG, String.format("Storage check: %dMB available, %dMB total, need ~%dMB for %d files",
+                    availableMB, totalMB, estimatedNeededMB, fileCount));
+
+            if (availableMB < MIN_STORAGE_REQUIRED_MB) {
+                return new StorageCheckResult(false,
+                        String.format("Not enough storage! Only %dMB free (need %dMB minimum)",
+                                availableMB, MIN_STORAGE_REQUIRED_MB),
+                        availableMB, totalMB);
+            }
+
+            if (availableMB < estimatedNeededMB) {
+                return new StorageCheckResult(false,
+                        String.format("Low storage! %dMB free, may need ~%dMB for %d files",
+                                availableMB, estimatedNeededMB, fileCount),
+                        availableMB, totalMB);
+            }
+
+            return new StorageCheckResult(true, "Storage OK", availableMB, totalMB);
+
+        } catch (Exception e) {
+            Log.e(TAG, "Error checking storage: " + e.getMessage());
+            // Allow download on error, but log the issue
+            return new StorageCheckResult(true, "Storage check failed, proceeding anyway", 0, 0);
+        }
+    }
+
+    /**
+     * Check if device has enough RAM available.
+     */
+    private RamCheckResult checkRamBeforeDownload() {
+        try {
+            Runtime runtime = Runtime.getRuntime();
+            long maxMemory = runtime.maxMemory();
+            long usedMemory = runtime.totalMemory() - runtime.freeMemory();
+            long availableMemory = maxMemory - usedMemory;
+
+            long availableMB = availableMemory / (1024 * 1024);
+            long totalMB = maxMemory / (1024 * 1024);
+
+            Log.d(TAG, String.format("RAM check: %dMB available, %dMB max heap", availableMB, totalMB));
+
+            if (availableMB < MIN_RAM_REQUIRED_MB) {
+                // Try to free memory
+                System.gc();
+
+                // Re-check after GC
+                usedMemory = runtime.totalMemory() - runtime.freeMemory();
+                availableMemory = maxMemory - usedMemory;
+                availableMB = availableMemory / (1024 * 1024);
+
+                if (availableMB < MIN_RAM_REQUIRED_MB) {
+                    return new RamCheckResult(false,
+                            String.format("Low memory! Only %dMB RAM free", availableMB),
+                            availableMB, totalMB);
+                }
+            }
+
+            return new RamCheckResult(true, "RAM OK", availableMB, totalMB);
+
+        } catch (Exception e) {
+            Log.e(TAG, "Error checking RAM: " + e.getMessage());
+            return new RamCheckResult(true, "RAM check failed, proceeding anyway", 0, 0);
+        }
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -1468,6 +1627,24 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
 
         // Download only NEW content
         if (!urlsToDownload.isEmpty()) {
+            // Check storage space before downloading
+            StorageCheckResult storageCheck = checkStorageBeforeDownload(urlsToDownload.size());
+            if (!storageCheck.canDownload) {
+                ui.post(() -> toast("⚠️ " + storageCheck.message));
+                Log.e(TAG, "Download aborted: " + storageCheck.message);
+                // Report storage status to server so dashboard shows the issue
+                reportStorageToServer();
+                return false;
+            }
+
+            // Check RAM availability
+            RamCheckResult ramCheck = checkRamBeforeDownload();
+            if (!ramCheck.canProceed) {
+                ui.post(() -> toast("⚠️ " + ramCheck.message));
+                Log.e(TAG, "Download aborted: " + ramCheck.message);
+                return false;
+            }
+
             ui.post(() -> toast("Downloading " + urlsToDownload.size() + " new file(s)…"));
             int downloaded = 0;
             int failed = 0;
@@ -1613,6 +1790,7 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
     /**
      * Post online status and check if device is still active.
      * Returns true if device should continue playing, false if it should show enrollment screen.
+     * Also handles wipe_videos command from server.
      */
     private boolean postOnlineAndCheckStatus(String url) throws Exception {
         HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
@@ -1634,7 +1812,7 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
             return false;
         }
 
-        // For 200, parse the response to check is_active and company_expired
+        // For 200, parse the response to check is_active, company_expired, and wipe_videos
         if (responseCode == 200) {
             try (BufferedReader reader = new BufferedReader(new InputStreamReader(c.getInputStream()))) {
                 StringBuilder sb = new StringBuilder();
@@ -1644,8 +1822,14 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
                 }
                 String response = sb.toString();
 
-                // Parse JSON response to check is_active and company_expired
+                // Parse JSON response
                 JSONObject json = new JSONObject(response);
+
+                // Check for wipe_videos command from server
+                if (json.optBoolean("wipe_videos", false)) {
+                    Log.d(TAG, "Server requested video wipe - deleting all local content");
+                    ui.post(() -> wipeAllLocalVideos());
+                }
 
                 // Check if company expired
                 if (json.optBoolean("company_expired", false)) {
@@ -1716,6 +1900,9 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
         // Stop grid players and release resources
         releaseGridResources();
 
+        // Stop TV time-sharing rotation (for Android TV grid mode)
+        stopTvRotation();
+
         // Stop image slideshow
         stopImageSlideshow();
 
@@ -1744,6 +1931,87 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
         currentPlaylistFiles.clear();
 
         Log.d(TAG, "All playback stopped");
+    }
+
+    /**
+     * Delete all video and image files from the device storage.
+     * Called when dashboard sends a "wipe_videos" command.
+     * This deletes from the same folder where videos are downloaded.
+     */
+    private void wipeAllLocalVideos() {
+        Log.d(TAG, "Wiping all local videos from device storage...");
+
+        // Stop any current playback first
+        stopAllPlayback();
+
+        new Thread(() -> {
+            try {
+                // Get the main video directory - same location where videos are downloaded
+                File mainDir = ensureMainDir();
+                File tempDir = ensureTempDir();
+
+                int deletedCount = 0;
+
+                // Delete all files in main directory
+                if (mainDir.exists() && mainDir.isDirectory()) {
+                    File[] files = mainDir.listFiles();
+                    if (files != null) {
+                        for (File file : files) {
+                            if (file.isFile()) {
+                                String name = file.getName().toLowerCase();
+                                // Delete video and image files
+                                if (name.endsWith(".mp4") || name.endsWith(".webm") ||
+                                        name.endsWith(".mkv") || name.endsWith(".avi") ||
+                                        name.endsWith(".mov") || name.endsWith(".3gp") ||
+                                        name.endsWith(".jpg") || name.endsWith(".jpeg") ||
+                                        name.endsWith(".png") || name.endsWith(".gif") ||
+                                        name.endsWith(".webp") || name.endsWith(".bmp")) {
+                                    if (file.delete()) {
+                                        deletedCount++;
+                                        Log.d(TAG, "Deleted: " + file.getName());
+                                    } else {
+                                        Log.e(TAG, "Failed to delete: " + file.getName());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Also clean temp directory
+                if (tempDir.exists() && tempDir.isDirectory()) {
+                    File[] tempFiles = tempDir.listFiles();
+                    if (tempFiles != null) {
+                        for (File file : tempFiles) {
+                            if (file.isFile()) {
+                                if (file.delete()) {
+                                    Log.d(TAG, "Deleted temp file: " + file.getName());
+                                }
+                            }
+                        }
+                    }
+                }
+
+                final int finalCount = deletedCount;
+                Log.d(TAG, "Wipe complete. Deleted " + finalCount + " files.");
+
+                // Clear metadata cache
+                metadataByVideoName.clear();
+                metadataByFilename.clear();
+                currentPlaylistFiles.clear();
+                currentImageFiles.clear();
+
+                // Reset playback state on UI thread
+                ui.post(() -> {
+                    resetPlaybackState();
+                    toast("Deleted " + finalCount + " files. Waiting for new content...");
+                });
+
+            } catch (Exception e) {
+                Log.e(TAG, "Error wiping videos: " + e.getMessage());
+                ui.post(() -> toast("Error deleting files: " + e.getMessage()));
+            }
+        }).start();
     }
 
     private void deleteAllInDirectory(File dir) {
@@ -1844,28 +2112,117 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
         String finalUrl = resolveRedirects(urlStr);
 
         for (int attempt = 0; attempt < MAX_RETRIES; attempt++) {
-            HttpURLConnection c = (HttpURLConnection) new URL(finalUrl).openConnection();
-            c.setConnectTimeout(DOWNLOAD_TIMEOUT_MS); c.setReadTimeout(DOWNLOAD_TIMEOUT_MS);
-            if (have > 0) c.setRequestProperty("Range", "bytes=" + have + "-");
-            int code = c.getResponseCode();
-            if (code == 200 || code == 206) {
-                String cd = c.getHeaderField("Content-Disposition");
-                String fn = cd != null && cd.contains("filename=") ? cd.substring(cd.indexOf("filename=") + 9).replace("\"", "").trim() : name;
-                File out = new File(dir, fn.isEmpty() ? name : fn);
-                if (code == 200 && have > 0) { part.delete(); have = 0; }
-                try (InputStream in = c.getInputStream(); FileOutputStream fos = new FileOutputStream(part, have > 0)) {
-                    byte[] buf = new byte[131072]; int n;
-                    while ((n = in.read(buf)) != -1) fos.write(buf, 0, n);
-                } finally { c.disconnect(); }
-                if (out.exists()) out.delete();
-                part.renameTo(out);
-                return out;
+            HttpURLConnection c = null;
+            try {
+                c = (HttpURLConnection) new URL(finalUrl).openConnection();
+                c.setConnectTimeout(DOWNLOAD_TIMEOUT_MS);
+                c.setReadTimeout(DOWNLOAD_TIMEOUT_MS);
+                if (have > 0) {
+                    c.setRequestProperty("Range", "bytes=" + have + "-");
+                    Log.d(TAG, "Resuming download from byte " + have);
+                }
+
+                int code = c.getResponseCode();
+                Log.d(TAG, "Download response code: " + code + " for " + name);
+
+                if (code == 200 || code == 206) {
+                    // Get total file size
+                    long contentLength = c.getContentLengthLong();
+                    long totalSize = (code == 206) ? have + contentLength : contentLength;
+
+                    // Check if we have enough storage for this file
+                    if (totalSize > 0) {
+                        StatFs stat = new StatFs(dir.getPath());
+                        long availableBytes = stat.getAvailableBytes();
+                        if (availableBytes < totalSize + (10 * 1024 * 1024)) { // Need file size + 10MB buffer
+                            throw new RuntimeException("Not enough storage space for " + name +
+                                    " (need " + (totalSize / 1024 / 1024) + "MB, have " + (availableBytes / 1024 / 1024) + "MB)");
+                        }
+                    }
+
+                    String cd = c.getHeaderField("Content-Disposition");
+                    String fn = cd != null && cd.contains("filename=") ?
+                            cd.substring(cd.indexOf("filename=") + 9).replace("\"", "").trim() : name;
+                    File out = new File(dir, fn.isEmpty() ? name : fn);
+
+                    if (code == 200 && have > 0) {
+                        part.delete();
+                        have = 0;
+                    }
+
+                    try (InputStream in = c.getInputStream();
+                         FileOutputStream fos = new FileOutputStream(part, have > 0)) {
+                        byte[] buf = new byte[131072]; // 128KB buffer
+                        int n;
+                        long downloaded = have;
+                        long lastProgressLog = System.currentTimeMillis();
+
+                        while ((n = in.read(buf)) != -1) {
+                            fos.write(buf, 0, n);
+                            downloaded += n;
+
+                            // Log progress every 5 seconds
+                            long now = System.currentTimeMillis();
+                            if (now - lastProgressLog > 5000) {
+                                lastProgressLog = now;
+                                if (totalSize > 0) {
+                                    int percent = (int) ((downloaded * 100) / totalSize);
+                                    Log.d(TAG, "Downloading " + name + ": " + percent + "% (" +
+                                            (downloaded / 1024 / 1024) + "MB / " + (totalSize / 1024 / 1024) + "MB)");
+                                } else {
+                                    Log.d(TAG, "Downloading " + name + ": " + (downloaded / 1024 / 1024) + "MB");
+                                }
+                            }
+                        }
+                        fos.flush();
+                    }
+
+                    c.disconnect();
+
+                    // Verify file was written correctly
+                    if (!part.exists() || part.length() == 0) {
+                        throw new RuntimeException("Download completed but file is empty: " + name);
+                    }
+
+                    // Rename part file to final name
+                    if (out.exists()) out.delete();
+                    if (part.renameTo(out)) {
+                        Log.d(TAG, "Download complete: " + out.getName() + " (" + (out.length() / 1024 / 1024) + "MB)");
+                        return out;
+                    } else {
+                        throw new RuntimeException("Failed to rename downloaded file: " + name);
+                    }
+                } else if (code == 416) {
+                    // Range not satisfiable - file may be complete, or server doesn't support resume
+                    Log.w(TAG, "Range not satisfiable, deleting partial and retrying full download");
+                    part.delete();
+                    have = 0;
+                    c.disconnect();
+                    continue;
+                } else {
+                    Log.e(TAG, "Download failed with code " + code + " for " + name);
+                    c.disconnect();
+                }
+            } catch (java.net.SocketTimeoutException e) {
+                Log.e(TAG, "Download timeout for " + name + " (attempt " + (attempt + 1) + "): " + e.getMessage());
+                if (c != null) c.disconnect();
+            } catch (java.io.IOException e) {
+                Log.e(TAG, "Download IO error for " + name + " (attempt " + (attempt + 1) + "): " + e.getMessage());
+                if (c != null) c.disconnect();
             }
-            c.disconnect();
-            Thread.sleep(1500L * (attempt + 1));
+
+            // Wait before retry with exponential backoff
+            long sleepTime = 2000L * (attempt + 1);
+            Log.d(TAG, "Retrying download in " + sleepTime + "ms (attempt " + (attempt + 2) + "/" + MAX_RETRIES + ")");
+            Thread.sleep(sleepTime);
             have = part.exists() ? part.length() : 0;
         }
-        throw new RuntimeException("Download failed");
+
+        // Clean up partial file on final failure
+        if (part.exists()) {
+            part.delete();
+        }
+        throw new RuntimeException("Download failed after " + MAX_RETRIES + " attempts: " + name);
     }
 
     private String resolveRedirects(String url) throws Exception {
@@ -3155,6 +3512,29 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
             lastGridRotations[i] = 0;
         }
 
+        // Count video slots needed
+        int videoSlotCount = 0;
+        for (File f : assignedMedia) {
+            VideoMetadata vm = getMetadataForFile(f);
+            String contentType = vm != null ? vm.contentType : (isImageFile(f) ? "image" : "video");
+            if (!"image".equals(contentType) && !isImageFile(f)) {
+                videoSlotCount++;
+            }
+        }
+
+        // On Android TV with 3+ videos, use time-sharing mode (single player rotates between slots)
+        // because TV devices typically only support 2 simultaneous hardware video decodes
+        boolean useTvTimeSharing = isTvDevice && videoSlotCount > 2;
+
+        if (useTvTimeSharing) {
+            Log.d(TAG, "TV MODE: Using time-sharing for " + videoSlotCount + " videos (hardware limit: 2 simultaneous)");
+            playGridVideosTvMode(assignedMedia, numSlots);
+            return;
+        }
+
+        // Standard mode: play all videos simultaneously (works on mobile and TV with ≤2 videos)
+        Log.d(TAG, "STANDARD MODE: Playing " + videoSlotCount + " videos simultaneously");
+
         // Create players/imageviews for each slot.
         // Use gridPosition (1-based) as the target slot index so videos land in
         // the correct slot even when some slots are intentionally empty.
@@ -3264,6 +3644,159 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
                 Log.d(TAG, "Grid slot " + slotIndex + ": " + mediaFile.getName() + " (video) rotation=" + rotation);
             }
         }
+    }
+
+    // ==================== TV TIME-SHARING MODE ====================
+    // For Android TV with limited hardware decoders, we use a single player
+    // that rotates between video slots, playing each video in its position
+    // for a period of time before moving to the next.
+
+    private Handler tvRotationHandler = new Handler(Looper.getMainLooper());
+    private Runnable tvRotationRunnable;
+    private int tvCurrentSlotIndex = 0;
+    private List<Integer> tvVideoSlots = new ArrayList<>();
+    private List<File> tvVideoFiles = new ArrayList<>();
+    private ExoPlayer tvSharedPlayer;
+    private static final long TV_ROTATION_INTERVAL_MS = 8000; // 8 seconds per video
+
+    private void playGridVideosTvMode(List<File> assignedMedia, int numSlots) {
+        // Clear previous TV rotation state
+        stopTvRotation();
+        tvVideoSlots.clear();
+        tvVideoFiles.clear();
+
+        // First, display all images in their slots (images don't need decoder)
+        // and collect video slots for rotation
+        for (int i = 0; i < assignedMedia.size(); i++) {
+            File mediaFile = assignedMedia.get(i);
+            VideoMetadata vm = getMetadataForFile(mediaFile);
+
+            int rawPos = vm != null ? vm.gridPosition : 0;
+            final int slotIndex = (rawPos > 0 && rawPos <= numSlots) ? rawPos - 1 : i;
+            if (slotIndex >= numSlots) continue;
+
+            int rotation = vm != null ? vm.rotation : 0;
+            String fitMode = vm != null ? vm.fitMode : "cover";
+            String contentType = vm != null ? vm.contentType : (isImageFile(mediaFile) ? "image" : "video");
+
+            gridVideoFiles[slotIndex] = mediaFile;
+            lastGridRotations[slotIndex] = rotation;
+
+            if ("image".equals(contentType) || isImageFile(mediaFile)) {
+                // Handle image slot (same as standard mode)
+                if (gridTextureViews[slotIndex] != null) {
+                    gridTextureViews[slotIndex].setVisibility(View.GONE);
+                }
+
+                if (gridImageViews[slotIndex] == null) {
+                    gridImageViews[slotIndex] = new ImageView(this);
+                    FrameLayout.LayoutParams params = getGridLayoutParams(layoutMode, slotIndex, numSlots);
+                    rootContainer.addView(gridImageViews[slotIndex], params);
+                }
+
+                try {
+                    Bitmap bitmap = BitmapFactory.decodeFile(mediaFile.getAbsolutePath());
+                    if (bitmap != null) {
+                        if (rotation != 0) {
+                            Matrix matrix = new Matrix();
+                            matrix.postRotate(rotation);
+                            bitmap = Bitmap.createBitmap(bitmap, 0, 0, bitmap.getWidth(), bitmap.getHeight(), matrix, true);
+                        }
+                        gridImageViews[slotIndex].setScaleType(ImageView.ScaleType.CENTER_CROP);
+                        gridImageViews[slotIndex].setImageBitmap(bitmap);
+                        gridImageViews[slotIndex].setVisibility(View.VISIBLE);
+                    }
+                } catch (Exception e) {
+                    Log.e(TAG, "Failed to load image for grid slot " + slotIndex);
+                }
+            } else {
+                // Video slot - add to rotation list
+                tvVideoSlots.add(slotIndex);
+                tvVideoFiles.add(mediaFile);
+
+                // Make TextureView visible for this slot
+                if (gridTextureViews[slotIndex] != null) {
+                    gridTextureViews[slotIndex].setVisibility(View.VISIBLE);
+                }
+                if (gridImageViews[slotIndex] != null) {
+                    gridImageViews[slotIndex].setVisibility(View.GONE);
+                }
+            }
+        }
+
+        if (tvVideoSlots.isEmpty()) {
+            Log.d(TAG, "TV MODE: No videos to rotate");
+            return;
+        }
+
+        Log.d(TAG, "TV MODE: Starting rotation for " + tvVideoSlots.size() + " video slots");
+
+        // Create single shared player
+        tvSharedPlayer = new ExoPlayer.Builder(this).build();
+        tvSharedPlayer.setRepeatMode(Player.REPEAT_MODE_ONE);
+
+        // Start with first video slot
+        tvCurrentSlotIndex = 0;
+        playTvSlot(tvCurrentSlotIndex);
+
+        // Set up rotation timer
+        tvRotationRunnable = new Runnable() {
+            @Override
+            public void run() {
+                // Move to next slot
+                tvCurrentSlotIndex = (tvCurrentSlotIndex + 1) % tvVideoSlots.size();
+                playTvSlot(tvCurrentSlotIndex);
+                tvRotationHandler.postDelayed(this, TV_ROTATION_INTERVAL_MS);
+            }
+        };
+        tvRotationHandler.postDelayed(tvRotationRunnable, TV_ROTATION_INTERVAL_MS);
+    }
+
+    private void playTvSlot(int index) {
+        if (index >= tvVideoSlots.size() || index >= tvVideoFiles.size()) return;
+        if (tvSharedPlayer == null) return;
+
+        int slotIndex = tvVideoSlots.get(index);
+        File mediaFile = tvVideoFiles.get(index);
+        VideoMetadata vm = getMetadataForFile(mediaFile);
+        int rotation = vm != null ? vm.rotation : 0;
+        String fitMode = vm != null ? vm.fitMode : "cover";
+
+        Log.d(TAG, "TV MODE: Playing slot " + slotIndex + " -> " + mediaFile.getName());
+
+        // Detach from previous surface
+        tvSharedPlayer.setVideoSurface(null);
+
+        // Attach to new slot's surface
+        if (gridSurfaces[slotIndex] != null) {
+            tvSharedPlayer.setVideoSurface(gridSurfaces[slotIndex]);
+        }
+
+        // Apply rotation transform
+        if (gridTextureViews[slotIndex] != null) {
+            applyGridTextureViewTransform(gridTextureViews[slotIndex], rotation, fitMode, slotIndex);
+        }
+
+        // Play the video
+        MediaItem item = MediaItem.fromUri(Uri.fromFile(mediaFile));
+        tvSharedPlayer.setMediaItem(item);
+        tvSharedPlayer.prepare();
+        tvSharedPlayer.play();
+    }
+
+    private void stopTvRotation() {
+        tvRotationHandler.removeCallbacksAndMessages(null);
+        if (tvSharedPlayer != null) {
+            try {
+                tvSharedPlayer.stop();
+                tvSharedPlayer.release();
+            } catch (Exception e) {
+                Log.e(TAG, "Error releasing TV shared player: " + e.getMessage());
+            }
+            tvSharedPlayer = null;
+        }
+        tvVideoSlots.clear();
+        tvVideoFiles.clear();
     }
 
     private void applyGridTextureViewTransform(TextureView tv, int rotation, String fitMode, int slotIndex) {

@@ -184,7 +184,7 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
     private boolean isShowingImage = false;
 
     private volatile boolean isWorking = false;
-    private volatile boolean downloadInProgress = false;
+    private final java.util.concurrent.atomic.AtomicBoolean downloadInProgress = new java.util.concurrent.atomic.AtomicBoolean(false);
 
     // "Content updating..." overlay shown while downloads are in progress
     private TextView downloadStatusOverlay;
@@ -656,7 +656,7 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
 
         // 1) Reset working flags so startEverything() is not blocked
         isWorking = false;
-        downloadInProgress = false;
+        downloadInProgress.set(false);
 
         // 2) Reset video state tracking so content detection works fresh
         lastKnownVideoState = "";
@@ -872,13 +872,12 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
                     Log.e(TAG, "Error checking download status: " + e.getMessage());
                 }
 
-                // Check if there are videos we don't have locally - trigger download
-                checkForMissingVideosAndDownload(byFile);
-
-                // If download is needed according to backend, also trigger sync
-                if (downloadNeeded && !downloadInProgress) {
+                // If backend says download_status=false, run a full sync FIRST (before
+                // checkForMissingVideosAndDownload) and return early.  Using compareAndSet
+                // here ensures that even if checkForMissingVideosAndDownload races with us
+                // on the next poll interval, only one sync thread can run at a time.
+                if (downloadNeeded && downloadInProgress.compareAndSet(false, true)) {
                     File mainDir = ensureMainDir();
-                    downloadInProgress = true;
                     setDownloadingOverlay(true);
                     try {
                         smartSyncVideos(mainDir, deviceId);
@@ -912,10 +911,13 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
                         Log.e(TAG, "Sync error: " + e.getMessage());
                         setDownloadingOverlay(false);
                     } finally {
-                        downloadInProgress = false;
+                        downloadInProgress.set(false);
                     }
                     return;  // Skip rotation apply since we're refreshing
                 }
+
+                // Check if there are videos we don't have locally - trigger download
+                checkForMissingVideosAndDownload(byFile);
 
                 // If layout changed, switch between single and grid mode
                 if (layoutChanged) {
@@ -964,7 +966,7 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
     private String lastKnownContentType = ""; // Track content type changes
 
     private void checkForMissingVideosAndDownload(Map<String, VideoMetadata> serverContent) {
-        if (downloadInProgress) return;
+        if (downloadInProgress.get()) return;  // quick non-blocking early exit
 
         // Handle empty server response (device might have no content assigned)
         if (serverContent.isEmpty()) {
@@ -1016,6 +1018,14 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
             }
 
             if (hasMissingContent) {
+                // Atomically claim the download lock before spawning the thread.
+                // This prevents a TOCTOU race where pollRotationMetadata's inline sync
+                // and this background thread both see downloadInProgress=false and both
+                // proceed with a simultaneous download of the same files.
+                if (!downloadInProgress.compareAndSet(false, true)) {
+                    Log.d(TAG, "Download already in progress, skipping duplicate download");
+                    return;
+                }
                 Log.d(TAG, "New content detected, triggering download...");
                 ui.post(() -> {
                     toast("New content detected, downloading...");
@@ -1023,10 +1033,8 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
                 });
                 lastKnownVideoState = currentState;
 
-                // Trigger download in background
+                // Trigger download in background (lock already acquired via compareAndSet above)
                 new Thread(() -> {
-                    if (downloadInProgress) return;
-                    downloadInProgress = true;
                     try {
                         String id = getAndroidId();
                         boolean downloadSuccess = smartSyncVideos(mainDir, id);
@@ -1064,7 +1072,7 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
                         Log.e(TAG, "Download error: " + e.getMessage());
                         setDownloadingOverlay(false);
                     } finally {
-                        downloadInProgress = false;
+                        downloadInProgress.set(false);
                     }
                 }).start();
             } else if (videoStateChanged) {
@@ -1240,7 +1248,7 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
     }
 
     private void startEverything() {
-        if (isWorking || downloadInProgress) return;
+        if (isWorking || downloadInProgress.get()) return;
         isWorking = true;
         new Thread(() -> {
             try {
@@ -1264,13 +1272,13 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
 
                 boolean downloadSuccess = true;
                 if (!readDownloadStatus(readStatusUrl(id))) {
-                    downloadInProgress = true;
+                    downloadInProgress.set(true);
                     setDownloadingOverlay(true);
                     try {
                         // SMART SYNC: Only download new, delete unassigned
                         downloadSuccess = smartSyncVideos(mainDir, id);
                         // DON'T update status here - wait until content plays
-                    } finally { downloadInProgress = false; }
+                    } finally { downloadInProgress.set(false); }
                 }
 
                 // Fetch layout mode and metadata BEFORE playing
@@ -1752,7 +1760,7 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
 
     private void startBackgroundCheckIfNeeded() {
         if (!isEnrolled) return; // Don't sync if device is not enrolled
-        if (isWorking || downloadInProgress) return;
+        if (isWorking || downloadInProgress.get()) return;
         isWorking = true;
         new Thread(() -> {
             try {
@@ -1785,7 +1793,7 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
                 }
 
                 if (!readDownloadStatus(readStatusUrl(id))) {
-                    downloadInProgress = true;
+                    downloadInProgress.set(true);
                     setDownloadingOverlay(true);
                     try {
                         // Use smart sync instead of full re-download
@@ -1815,7 +1823,7 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
                                 }, 2000); // 2 second delay
                             }
                         });
-                    } finally { downloadInProgress = false; }
+                    } finally { downloadInProgress.set(false); }
                 }
             } catch (Exception ignored) {}
             finally { isWorking = false; }
@@ -3692,6 +3700,15 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
             } else {
                 // Handle video slot
                 Log.d(TAG, "Grid slot " + slotIndex + " is VIDEO: " + mediaFile.getName());
+
+                // Skip slots whose file hasn't finished downloading yet.
+                // Without this guard, ExoPlayer throws FileDataSourceException when a large
+                // video is still downloading while switchToGridMode() fires for the other
+                // already-downloaded files — resulting in a partial grid (e.g. 2/4 slots).
+                if (!mediaFile.exists() || mediaFile.length() == 0) {
+                    Log.w(TAG, "Grid slot " + slotIndex + ": file missing or empty, skipping: " + mediaFile.getName());
+                    continue;
+                }
 
                 // Make sure TextureView is visible
                 if (gridTextureViews[slotIndex] != null) {

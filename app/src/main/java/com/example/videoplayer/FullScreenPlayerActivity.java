@@ -114,9 +114,9 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
     // ==========================================
 
     // Network timeouts (milliseconds)
-    private static final int CONNECT_TIMEOUT_MS = 30_000;   // 30 seconds for connection
-    private static final int READ_TIMEOUT_MS = 60_000;      // 60 seconds for reading
-    private static final int DOWNLOAD_TIMEOUT_MS = 600_000; // 10 minutes for large file downloads
+    private static final int CONNECT_TIMEOUT_MS = 30_000;     // 30 seconds for connection
+    private static final int READ_TIMEOUT_MS = 60_000;        // 60 seconds for reading
+    private static final int DOWNLOAD_TIMEOUT_MS = 1_800_000; // 30 minutes for large file downloads
     private static final long MIN_STORAGE_REQUIRED_MB = 100; // Minimum 100MB free space required
     private static final long MIN_RAM_REQUIRED_MB = 50;      // Minimum 50MB RAM required
 
@@ -185,6 +185,9 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
 
     private volatile boolean isWorking = false;
     private volatile boolean downloadInProgress = false;
+
+    // "Content updating..." overlay shown while downloads are in progress
+    private TextView downloadStatusOverlay;
 
     // Playback generation counter: prevents duplicate players when multiple code paths
     // trigger playMixedPlaylist simultaneously (causing dual audio + frozen video frames)
@@ -307,6 +310,9 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
         imageView.setScaleType(ImageView.ScaleType.FIT_CENTER);
         imageView.setVisibility(View.GONE);
         rootContainer.addView(imageView, 0);  // Add behind textureView
+
+        // Create "Content updating..." overlay (shown during downloads)
+        createDownloadStatusOverlay();
 
         // Find enrollment overlay views
         enrollmentOverlay = findViewById(R.id.enrollmentOverlay);
@@ -701,10 +707,12 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
             lastGridRotations[i] = 0;
         }
 
-        // 10) Detach enrollment overlay before clearing rootContainer
-        //     (we need to keep it alive and re-add it)
+        // 10) Detach overlays before clearing rootContainer (keep them alive for re-add)
         if (enrollmentOverlay != null && enrollmentOverlay.getParent() != null) {
             rootContainer.removeView(enrollmentOverlay);
+        }
+        if (downloadStatusOverlay != null && downloadStatusOverlay.getParent() != null) {
+            rootContainer.removeView(downloadStatusOverlay);
         }
 
         // 11) Clear rootContainer and rebuild views fresh
@@ -732,6 +740,13 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
             rootContainer.addView(enrollmentOverlay);
         }
 
+        // Re-add download status overlay on top of everything
+        if (downloadStatusOverlay != null) {
+            rootContainer.addView(downloadStatusOverlay);
+        } else {
+            createDownloadStatusOverlay();
+        }
+
         Log.d(TAG, "Playback state reset complete");
     }
 
@@ -751,6 +766,39 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
             }
 
             toast("Device ID copied to clipboard");
+        }
+    }
+
+    // ===== DOWNLOAD STATUS OVERLAY =====
+
+    private void createDownloadStatusOverlay() {
+        downloadStatusOverlay = new TextView(this);
+        FrameLayout.LayoutParams p = new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+                FrameLayout.LayoutParams.WRAP_CONTENT);
+        p.gravity = android.view.Gravity.CENTER;
+        downloadStatusOverlay.setLayoutParams(p);
+        downloadStatusOverlay.setText("Content updating...");
+        downloadStatusOverlay.setTextColor(0xFFFFFFFF);
+        downloadStatusOverlay.setTextSize(18f);
+        downloadStatusOverlay.setBackgroundColor(0xCC000000);
+        int pad = (int) (16 * getResources().getDisplayMetrics().density);
+        downloadStatusOverlay.setPadding(pad * 2, pad, pad * 2, pad);
+        downloadStatusOverlay.setVisibility(View.GONE);
+        rootContainer.addView(downloadStatusOverlay);
+    }
+
+    private void setDownloadingOverlay(boolean show) {
+        if (android.os.Looper.myLooper() == android.os.Looper.getMainLooper()) {
+            if (downloadStatusOverlay != null) {
+                downloadStatusOverlay.setVisibility(show ? View.VISIBLE : View.GONE);
+            }
+        } else {
+            ui.post(() -> {
+                if (downloadStatusOverlay != null) {
+                    downloadStatusOverlay.setVisibility(show ? View.VISIBLE : View.GONE);
+                }
+            });
         }
     }
 
@@ -831,6 +879,7 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
                 if (downloadNeeded && !downloadInProgress) {
                     File mainDir = ensureMainDir();
                     downloadInProgress = true;
+                    setDownloadingOverlay(true);
                     try {
                         smartSyncVideos(mainDir, deviceId);
                         postUpdateStatusTrue(updateStatusUrl(deviceId));
@@ -842,6 +891,7 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
                         final String currentLayoutMode = layoutMode;
                         final boolean layoutAlsoChanged = layoutChanged;
                         ui.post(() -> {
+                            setDownloadingOverlay(false);
                             if (layoutAlsoChanged) {
                                 // Layout changed during the sync window — do a proper switch
                                 if ("single".equals(currentLayoutMode) || currentLayoutMode == null) {
@@ -860,6 +910,7 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
                         });
                     } catch (Exception e) {
                         Log.e(TAG, "Sync error: " + e.getMessage());
+                        setDownloadingOverlay(false);
                     } finally {
                         downloadInProgress = false;
                     }
@@ -966,7 +1017,10 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
 
             if (hasMissingContent) {
                 Log.d(TAG, "New content detected, triggering download...");
-                ui.post(() -> toast("New content detected, downloading..."));
+                ui.post(() -> {
+                    toast("New content detected, downloading...");
+                    setDownloadingOverlay(true);
+                });
                 lastKnownVideoState = currentState;
 
                 // Trigger download in background
@@ -978,14 +1032,18 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
                         boolean downloadSuccess = smartSyncVideos(mainDir, id);
                         // DON'T update status here - wait until content plays
 
-                        // After download, refresh with mixed playlist to handle images
+                        // Capture layoutMode now (on background thread) before posting to UI.
+                        // Using isGridMode here is WRONG after a wipe: resetPlaybackState()
+                        // clears isGridMode=false, but layoutMode is re-fetched from the
+                        // server by pollRotationMetadata() before this download was triggered,
+                        // so layoutMode correctly reflects the intended grid configuration.
+                        final String modeAfterDownload = layoutMode;
                         ui.post(() -> {
-                            if (isGridMode) {
-                                // Refresh grid with new content
-                                switchToGridMode();
-                            } else {
-                                // Use mixed playlist for single mode
+                            setDownloadingOverlay(false);
+                            if ("single".equals(modeAfterDownload) || modeAfterDownload == null) {
                                 playMixedPlaylist(mainDir);
+                            } else {
+                                switchToGridMode();
                             }
 
                             // Update download status AFTER playback starts
@@ -1004,6 +1062,7 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
                         });
                     } catch (Exception e) {
                         Log.e(TAG, "Download error: " + e.getMessage());
+                        setDownloadingOverlay(false);
                     } finally {
                         downloadInProgress = false;
                     }
@@ -1206,6 +1265,7 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
                 boolean downloadSuccess = true;
                 if (!readDownloadStatus(readStatusUrl(id))) {
                     downloadInProgress = true;
+                    setDownloadingOverlay(true);
                     try {
                         // SMART SYNC: Only download new, delete unassigned
                         downloadSuccess = smartSyncVideos(mainDir, id);
@@ -1220,6 +1280,7 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
                 final boolean finalDownloadSuccess = downloadSuccess;
                 final String finalId = id;
                 ui.post(() -> {
+                    setDownloadingOverlay(false);
                     if ("single".equals(layoutMode) || layoutMode == null) {
                         // Use mixed playlist to handle both videos and images
                         playMixedPlaylist(mainDir);
@@ -1725,6 +1786,7 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
 
                 if (!readDownloadStatus(readStatusUrl(id))) {
                     downloadInProgress = true;
+                    setDownloadingOverlay(true);
                     try {
                         // Use smart sync instead of full re-download
                         boolean downloadSuccess = smartSyncVideos(mainDir, id);
@@ -1732,6 +1794,7 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
                         // Use current layoutMode to decide playback mode
                         final String currentLayoutMode = layoutMode;
                         ui.post(() -> {
+                            setDownloadingOverlay(false);
                             if ("single".equals(currentLayoutMode) || currentLayoutMode == null) {
                                 playMixedPlaylist(mainDir);
                             } else {
@@ -2228,7 +2291,10 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
     private String resolveRedirects(String url) throws Exception {
         for (int i = 0; i < 10; i++) {
             HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
-            c.setInstanceFollowRedirects(false); c.setRequestMethod("HEAD"); c.connect();
+            c.setInstanceFollowRedirects(false);
+            c.setConnectTimeout(CONNECT_TIMEOUT_MS);
+            c.setReadTimeout(READ_TIMEOUT_MS);
+            c.setRequestMethod("HEAD"); c.connect();
             int code = c.getResponseCode();
             String loc = c.getHeaderField("Location");
             c.disconnect();
@@ -3242,6 +3308,11 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
                 rootContainer.addView(enrollmentOverlay);
             }
 
+            // Re-add download status overlay on top of everything
+            if (downloadStatusOverlay != null && downloadStatusOverlay.getParent() == null) {
+                rootContainer.addView(downloadStatusOverlay);
+            }
+
             // NO playMixedPlaylist here — it will be called when surface is ready
         }, 300);
     }
@@ -3294,9 +3365,12 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
 
         // Small delay to allow surfaces to be released
         ui.postDelayed(() -> {
-            // Detach enrollment overlay before clearing (we'll re-add it)
+            // Detach overlays before clearing (we'll re-add them on top)
             if (enrollmentOverlay != null && enrollmentOverlay.getParent() != null) {
                 rootContainer.removeView(enrollmentOverlay);
+            }
+            if (downloadStatusOverlay != null && downloadStatusOverlay.getParent() != null) {
+                rootContainer.removeView(downloadStatusOverlay);
             }
 
             // Remove current views
@@ -3363,6 +3437,11 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
             if (enrollmentOverlay != null && enrollmentOverlay.getParent() == null) {
                 enrollmentOverlay.setVisibility(View.GONE);
                 rootContainer.addView(enrollmentOverlay);
+            }
+
+            // Re-add download status overlay on top of everything
+            if (downloadStatusOverlay != null && downloadStatusOverlay.getParent() == null) {
+                rootContainer.addView(downloadStatusOverlay);
             }
         }, 50);
     }

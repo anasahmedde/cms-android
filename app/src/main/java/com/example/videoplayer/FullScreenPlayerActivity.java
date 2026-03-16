@@ -3609,17 +3609,7 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
             }
         }
 
-        // On Android TV with 3+ videos, use time-sharing mode (single player rotates between slots)
-        // because TV devices typically only support 2 simultaneous hardware video decodes
-        boolean useTvTimeSharing = isTvDevice && videoSlotCount > 2;
-
-        if (useTvTimeSharing) {
-            Log.d(TAG, "TV MODE: Using time-sharing for " + videoSlotCount + " videos (hardware limit: 2 simultaneous)");
-            playGridVideosTvMode(assignedMedia, numSlots);
-            return;
-        }
-
-        // Standard mode: play all videos simultaneously (works on mobile and TV with ≤2 videos)
+        // Standard mode: play all videos simultaneously on both mobile and TV
         Log.d(TAG, "STANDARD MODE: Playing " + videoSlotCount + " videos simultaneously");
 
         // Create players/imageviews for each slot.

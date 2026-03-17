@@ -108,8 +108,8 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
     // ==========================================
     // BACKEND URL CONFIGURATION - CHANGE THIS
     // ==========================================
-    // private static final String API_BASE = "https://api-cms.wizioners.com";
-    private static final String API_BASE = "https://api-staging-cms.wizioners.com";
+     private static final String API_BASE = "https://api-cms.wizioners.com";
+    // private static final String API_BASE = "https://api-staging-cms.wizioners.com";
 
     // ==========================================
 
@@ -128,7 +128,11 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
     private static String countsUrl(String id) { return API_BASE + "/device/" + id + "/counts"; }
     private static String dailyUpdateUrl(String id) { return API_BASE + "/device/" + id + "/daily_update"; }
     private static String monthlyUpdateUrl(String id) { return API_BASE + "/device/" + id + "/monthly_update"; }
-    private static String checkDeviceUrl(String id) { return API_BASE + "/device/" + id + "/online"; }
+    private String checkDeviceUrl(String id) {
+        // Include the device's actual screen resolution so the backend can cache it
+        // even before the device is enrolled (powers the auto-detect in the CMS UI).
+        return API_BASE + "/device/" + id + "/online?resolution=" + screenWidth + "x" + screenHeight;
+    }
 
     // Enrollment status
     private LinearLayout enrollmentOverlay;
@@ -1872,7 +1876,9 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
         c.setRequestProperty("Content-Type", "application/json; charset=UTF-8");
 
         try (DataOutputStream out = new DataOutputStream(c.getOutputStream())) {
-            out.write("{\"is_online\": true}".getBytes(StandardCharsets.UTF_8));
+            String body = "{\"is_online\": true, \"resolution\": \""
+                    + screenWidth + "x" + screenHeight + "\"}";
+            out.write(body.getBytes(StandardCharsets.UTF_8));
         }
 
         int responseCode = c.getResponseCode();
@@ -1941,7 +1947,9 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
         c.setDoOutput(true);
         c.setRequestProperty("Content-Type", "application/json; charset=UTF-8");
         try (DataOutputStream out = new DataOutputStream(c.getOutputStream())) {
-            out.write("{\"is_online\": true}".getBytes(StandardCharsets.UTF_8));
+            String body = "{\"is_online\": true, \"resolution\": \""
+                    + screenWidth + "x" + screenHeight + "\"}";
+            out.write(body.getBytes(StandardCharsets.UTF_8));
         }
         c.getResponseCode();
         c.disconnect();

@@ -108,8 +108,8 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
     // ==========================================
     // BACKEND URL CONFIGURATION - CHANGE THIS
     // ==========================================
-     private static final String API_BASE = "https://api-cms.wizioners.com";
-    // private static final String API_BASE = "https://api-staging-cms.wizioners.com";
+     // private static final String API_BASE = "https://api-cms.wizioners.com";
+     private static final String API_BASE = "https://api-staging-cms.wizioners.com";
 
     // ==========================================
 
@@ -389,6 +389,33 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
     @Override
     public void onSurfaceTextureUpdated(SurfaceTexture surfaceTexture) {
         // Called every frame - no logging needed
+    }
+
+    @Override
+    protected void onPause() {
+        super.onPause();
+        // Stop all polling so background threads don't keep running while the app is hidden
+        pollHandler.removeCallbacksAndMessages(null);
+        rotationPollHandler.removeCallbacksAndMessages(null);
+        enrollmentCheckHandler.removeCallbacksAndMessages(null);
+        tempHandler.removeCallbacksAndMessages(null);
+        imageTimerHandler.removeCallbacksAndMessages(null);
+        transitionWatcherHandler.removeCallbacksAndMessages(null);
+        // Pause video players to release audio focus and reduce resource use
+        if (player != null) {
+            try { player.pause(); } catch (Exception ignored) {}
+        }
+        for (ExoPlayer gp : gridPlayers) {
+            if (gp != null) try { gp.pause(); } catch (Exception ignored) {}
+        }
+    }
+
+    /** Called when the user presses the Home button (not Back). Finish the activity
+     *  so the app does not linger in the background / recent apps list. */
+    @Override
+    protected void onUserLeaveHint() {
+        super.onUserLeaveHint();
+        finishAndRemoveTask();
     }
 
     @Override

@@ -63,7 +63,7 @@
         <activity
             android:name=".FullScreenPlayerActivity"
             android:exported="true"
-            android:screenOrientation="fullSensor"
+            android:screenOrientation="sensorLandscape"
             android:configChanges="orientation|screenSize|screenLayout|keyboardHidden">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />

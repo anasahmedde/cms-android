@@ -422,6 +422,15 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
     protected void onResume() {
         super.onResume();
         applyImmersive();
+        // Resume players that were paused by onPause() (e.g. interrupted by a phone call).
+        // Home-button path calls finishAndRemoveTask() so the activity is destroyed and
+        // recreated fresh — this resume path only matters for non-home interruptions.
+        if (player != null) {
+            try { player.play(); } catch (Exception ignored) {}
+        }
+        for (ExoPlayer gp : gridPlayers) {
+            if (gp != null) try { gp.play(); } catch (Exception ignored) {}
+        }
         // Only restart poll handler if device is enrolled (otherwise enrollment check will start it)
         if (isEnrolled) {
             pollHandler.removeCallbacksAndMessages(null);
@@ -831,6 +840,17 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
                 }
             });
         }
+    }
+
+    /** Apply mute/unmute to every active ExoPlayer. Called from the heartbeat thread. */
+    private void applyMuteToAllPlayers(boolean muted) {
+        float vol = muted ? 0f : 1f;
+        ui.post(() -> {
+            if (player != null) try { player.setVolume(vol); } catch (Exception ignored) {}
+            for (ExoPlayer gp : gridPlayers) {
+                if (gp != null) try { gp.setVolume(vol); } catch (Exception ignored) {}
+            }
+        });
     }
 
     // ===== ROTATION POLLING =====
@@ -1934,6 +1954,9 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
                     Log.d(TAG, "Server requested video wipe - deleting all local content");
                     ui.post(() -> wipeAllLocalVideos());
                 }
+
+                // Apply mute/unmute from dashboard setting
+                applyMuteToAllPlayers(json.optBoolean("is_muted", false));
 
                 // Check if company expired
                 if (json.optBoolean("company_expired", false)) {

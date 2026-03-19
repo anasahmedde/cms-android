@@ -177,6 +177,8 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
     private TextureView[] gridTextureViews = new TextureView[4];
     private Surface[] gridSurfaces = new Surface[4];
     private boolean isGridMode = false;
+    // Prevents concurrent switchToGridMode() calls from stacking SurfaceTexture allocations
+    private volatile boolean gridSwitchInProgress = false;
 
     // Image display support
     private ImageView imageView;
@@ -408,6 +410,8 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
         for (ExoPlayer gp : gridPlayers) {
             if (gp != null) try { gp.pause(); } catch (Exception ignored) {}
         }
+        // Clear the in-progress flag so switchToGridMode isn't permanently blocked
+        gridSwitchInProgress = false;
     }
 
     /** Called when the user presses the Home button (not Back). Finish the activity
@@ -3384,6 +3388,14 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
     }
 
     private void switchToGridMode() {
+        // Debounce: if a switch is already in progress (resources releasing, delay pending),
+        // skip this call. Qualcomm c2 decoders need ~300ms to free output buffer slots after
+        // player.release() — stacking calls exhausts the SurfaceTexture buffer queue (NO_MEMORY).
+        if (gridSwitchInProgress) {
+            Log.d(TAG, "switchToGridMode: switch already in progress, skipping duplicate call");
+            return;
+        }
+        gridSwitchInProgress = true;
         Log.d(TAG, "Switching to GRID mode: " + layoutMode);
         isGridMode = true;
 
@@ -3429,8 +3441,10 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
         // Release any existing grid resources BEFORE removing views
         releaseGridResources();
 
-        // Small delay to allow surfaces to be released
+        // 300ms delay — Qualcomm's c2 codec framework releases output buffer slots
+        // asynchronously; 50ms was not enough, causing NO_MEMORY on the next decoder init.
         ui.postDelayed(() -> {
+            gridSwitchInProgress = false; // allow new switch calls once views are rebuilt
             // Detach overlays before clearing (we'll re-add them on top)
             if (enrollmentOverlay != null && enrollmentOverlay.getParent() != null) {
                 rootContainer.removeView(enrollmentOverlay);
@@ -3509,7 +3523,7 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
             if (downloadStatusOverlay != null && downloadStatusOverlay.getParent() == null) {
                 rootContainer.addView(downloadStatusOverlay);
             }
-        }, 50);
+        }, 300);
     }
 
     private int getGridSlots(String mode) {
@@ -3768,6 +3782,15 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
                     gridImageViews[slotIndex].setVisibility(View.GONE);
                 }
 
+                // Release any existing player for this slot before creating a new one
+                if (gridPlayers[slotIndex] != null) {
+                    try {
+                        gridPlayers[slotIndex].setVideoSurface(null);
+                        gridPlayers[slotIndex].stop();
+                        gridPlayers[slotIndex].release();
+                    } catch (Exception ignored) {}
+                    gridPlayers[slotIndex] = null;
+                }
                 gridPlayers[slotIndex] = new ExoPlayer.Builder(this).build();
                 gridPlayers[slotIndex].setRepeatMode(Player.REPEAT_MODE_ONE);
 

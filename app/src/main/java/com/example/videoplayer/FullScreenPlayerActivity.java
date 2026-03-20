@@ -414,21 +414,11 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
         gridSwitchInProgress = false;
     }
 
-    /** Called when the user presses the Home button (not Back). Finish the activity
-     *  so the app does not linger in the background / recent apps list. */
-    @Override
-    protected void onUserLeaveHint() {
-        super.onUserLeaveHint();
-        finishAndRemoveTask();
-    }
-
     @Override
     protected void onResume() {
         super.onResume();
         applyImmersive();
-        // Resume players that were paused by onPause() (e.g. interrupted by a phone call).
-        // Home-button path calls finishAndRemoveTask() so the activity is destroyed and
-        // recreated fresh — this resume path only matters for non-home interruptions.
+        // Resume players that were paused by onPause() (fixes stuck screen after Home press).
         if (player != null) {
             try { player.play(); } catch (Exception ignored) {}
         }

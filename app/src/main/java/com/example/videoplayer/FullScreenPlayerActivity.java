@@ -143,6 +143,7 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
     private static final String PREFS_NAME = "digix_player_prefs";
     private static final String PREF_WAS_ENROLLED = "was_enrolled";
     private static final String PREF_LAYOUT_JSON = "cached_layout_json";
+    private static final String PREF_IS_MUTED = "is_muted";
     private static final long ENROLLMENT_CHECK_MS = 15_000L; // Check every 15 seconds
     private final Handler enrollmentCheckHandler = new Handler(Looper.getMainLooper());
     private final Runnable enrollmentCheckRunnable = new Runnable() {
@@ -836,8 +837,11 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
         }
     }
 
-    /** Apply mute/unmute to every active ExoPlayer. Called from the heartbeat thread. */
+    /** Apply mute/unmute to every active ExoPlayer and persist the state locally. */
     private void applyMuteToAllPlayers(boolean muted) {
+        // Persist so the state survives offline periods and app restarts
+        getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
+                .putBoolean(PREF_IS_MUTED, muted).apply();
         float vol = muted ? 0f : 1f;
         ui.post(() -> {
             if (player != null) try { player.setVolume(vol); } catch (Exception ignored) {}
@@ -3039,6 +3043,11 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
         Log.d(TAG, "Creating new ExoPlayer");
         player = new ExoPlayer.Builder(this).build();
 
+        // Apply cached mute state immediately so audio is correct before the first heartbeat
+        boolean cachedMuted = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                .getBoolean(PREF_IS_MUTED, false);
+        player.setVolume(cachedMuted ? 0f : 1f);
+
         // Connect player to TextureView surface
         if (surface != null) {
             player.setVideoSurface(surface);
@@ -3808,6 +3817,9 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
                     gridPlayers[slotIndex] = null;
                 }
                 gridPlayers[slotIndex] = new ExoPlayer.Builder(this).build();
+                boolean cachedMuted = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                        .getBoolean(PREF_IS_MUTED, false);
+                gridPlayers[slotIndex].setVolume(cachedMuted ? 0f : 1f);
                 gridPlayers[slotIndex].setRepeatMode(Player.REPEAT_MODE_ONE);
 
                 if (gridSurfaces[slotIndex] != null) {

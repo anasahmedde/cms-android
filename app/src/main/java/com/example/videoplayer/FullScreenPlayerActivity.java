@@ -3396,10 +3396,46 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
         imageTimerHandler.removeCallbacksAndMessages(null);
         isShowingImage = false;
 
-        // Stop single player first - detach surface before stopping
+        // ── Step 1: Detach surfaces from ALL codecs before anything else ──
+        // Tells the hardware codec to disconnect from the BufferQueue.
+        if (player != null) {
+            try { player.setVideoSurface(null); } catch (Exception ignored) {}
+        }
+        for (int i = 0; i < gridPlayers.length; i++) {
+            if (gridPlayers[i] != null) {
+                try { gridPlayers[i].setVideoSurface(null); } catch (Exception ignored) {}
+            }
+        }
+
+        // ── Step 2: Release Surface wrapper objects ──
+        if (surface != null) {
+            try { surface.release(); } catch (Exception ignored) {}
+            surface = null;
+        }
+        for (int i = 0; i < gridSurfaces.length; i++) {
+            if (gridSurfaces[i] != null) {
+                try { gridSurfaces[i].release(); } catch (Exception ignored) {}
+                gridSurfaces[i] = null;
+            }
+        }
+
+        // ── Step 3: Remove ALL views synchronously (mirrors switchToSingleMode) ──
+        // This triggers onSurfaceTextureDestroyed on each TextureView immediately,
+        // so the old content disappears from the screen RIGHT NOW instead of staying
+        // frozen for the 300ms codec-drain window. Without this the old frame was
+        // visible as a frozen image until the postDelayed fired.
+        if (enrollmentOverlay != null && enrollmentOverlay.getParent() != null) {
+            rootContainer.removeView(enrollmentOverlay);
+        }
+        if (downloadStatusOverlay != null && downloadStatusOverlay.getParent() != null) {
+            rootContainer.removeView(downloadStatusOverlay);
+        }
+        rootContainer.removeAllViews();
+
+        // ── Step 4: Release ExoPlayers AFTER views are removed ──
+        // Views are gone so onSurfaceTextureDestroyed already called setVideoSurface(null).
         if (player != null) {
             try {
-                player.setVideoSurface(null);
                 player.stop();
                 player.clearMediaItems();
                 player.release();
@@ -3408,43 +3444,33 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
             }
             player = null;
         }
-        if (surface != null) {
-            try {
-                surface.release();
-            } catch (Exception e) {
-                Log.e(TAG, "Error releasing surface: " + e.getMessage());
-            }
-            surface = null;
-        }
-        // Release textureView SurfaceTexture
-        if (textureView != null) {
-            try {
-                SurfaceTexture st = textureView.getSurfaceTexture();
-                if (st != null) {
-                    st.release();
+        for (int i = 0; i < gridPlayers.length; i++) {
+            if (gridPlayers[i] != null) {
+                try {
+                    gridPlayers[i].stop();
+                    gridPlayers[i].clearMediaItems();
+                    gridPlayers[i].release();
+                } catch (Exception e) {
+                    Log.e(TAG, "Error releasing grid player " + i + ": " + e.getMessage());
                 }
-            } catch (Exception e) {
-                Log.e(TAG, "Error releasing textureView surface: " + e.getMessage());
+                gridPlayers[i] = null;
+            }
+            gridTextureViews[i] = null;
+            if (gridImageViews[i] != null) {
+                try { gridImageViews[i].setImageBitmap(null); } catch (Exception ignored) {}
+                gridImageViews[i] = null;
             }
         }
+        for (int i = 0; i < gridVideoFiles.length; i++) {
+            gridVideoFiles[i] = null;
+            lastGridRotations[i] = 0;
+        }
 
-        // Release any existing grid resources BEFORE removing views
-        releaseGridResources();
-
-        // 300ms delay — Qualcomm's c2 codec framework releases output buffer slots
-        // asynchronously; 50ms was not enough, causing NO_MEMORY on the next decoder init.
+        // ── Step 5: Wait 300ms for Qualcomm codec to release buffer slots, then build new views ──
+        // Qualcomm's c2 codec framework releases output buffer slots asynchronously;
+        // 50ms was not enough, causing NO_MEMORY on the next decoder init.
         ui.postDelayed(() -> {
             gridSwitchInProgress = false; // allow new switch calls once views are rebuilt
-            // Detach overlays before clearing (we'll re-add them on top)
-            if (enrollmentOverlay != null && enrollmentOverlay.getParent() != null) {
-                rootContainer.removeView(enrollmentOverlay);
-            }
-            if (downloadStatusOverlay != null && downloadStatusOverlay.getParent() != null) {
-                rootContainer.removeView(downloadStatusOverlay);
-            }
-
-            // Remove current views
-            rootContainer.removeAllViews();
 
             // Determine grid configuration
             final int numSlots = getGridSlots(layoutMode);
@@ -3460,7 +3486,7 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
                         Log.d(TAG, "Grid surface " + slotIndex + " available: " + w + "x" + h);
                         gridSurfaces[slotIndex] = new Surface(st);
 
-                        // If player already exists, attach surface
+                        // If player already exists (fallback path), attach surface now
                         if (gridPlayers[slotIndex] != null) {
                             gridPlayers[slotIndex].setVideoSurface(gridSurfaces[slotIndex]);
                         }

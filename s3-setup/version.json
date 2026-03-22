@@ -1,7 +1,7 @@
 {
   "versionCode": 1,
   "versionName": "1.0.0",
-  "apkUrl": "https://dgx-release-bucket.s3.amazonaws.com/releases/app-v1.0.0.apk",
+  "apkUrl": "https://dgx-release-bucket.s3.us-east-2.amazonaws.com/releases/app-v1.0.0.apk",
   "checksum": "",
   "releaseNotes": "Initial release",
   "forceUpdate": false

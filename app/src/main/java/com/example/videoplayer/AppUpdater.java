@@ -55,7 +55,7 @@ public class AppUpdater {
     // ── Public config ────────────────────────────────────────────────────────
     /** URL to your version.json on S3 (must be publicly readable). */
     public static final String VERSION_JSON_URL =
-            "https://dgx-release-bucket.s3.amazonaws.com/version.json";
+            "https://dgx-release-bucket.s3.us-east-2.amazonaws.com/version.json";
 
     // ── Internals ─────────────────────────────────────────────────────────────
     private final Context ctx;

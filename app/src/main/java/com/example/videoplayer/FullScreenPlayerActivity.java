@@ -83,6 +83,11 @@ import androidx.appcompat.app.AppCompatActivity;
 import androidx.core.app.ActivityCompat;
 import androidx.core.content.ContextCompat;
 
+// Self-update
+import com.example.videoplayer.AppUpdater;
+import com.example.videoplayer.UpdateCheckWorker;
+import com.example.videoplayer.UpdateUI;
+
 import androidx.media3.common.MediaItem;
 import androidx.media3.common.PlaybackException;
 import androidx.media3.common.Player;
@@ -356,6 +361,13 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
 
         tempHandler.postDelayed(tempPostRunnable, TEMP_POST_INTERVAL_MS);
         rotationPollHandler.postDelayed(rotationPollRunnable, ROTATION_POLL_MS);
+
+        // Self-update: check S3 for a newer APK, schedule background re-checks every 6 h
+        AppUpdater appUpdater = new AppUpdater(this, BuildConfig.VERSION_CODE);
+        UpdateUI updateUI = new UpdateUI(this);
+        updateUI.attach(appUpdater);
+        appUpdater.checkForUpdate();
+        UpdateCheckWorker.schedule(this);
 
         btAdapter = BluetoothAdapter.getDefaultAdapter();
         if (btAdapter != null) ensureBluetoothPermissionAndConnect();

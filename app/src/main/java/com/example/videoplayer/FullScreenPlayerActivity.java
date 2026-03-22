@@ -140,6 +140,7 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
     private TextView retryText;
     private Button copyButton;
     private volatile boolean isEnrolled = false;
+    private volatile boolean reconnectNeeded = false; // true when offline boot path ran; triggers re-sync on reconnect
     private static final String PREFS_NAME = "digix_player_prefs";
     private static final String PREF_WAS_ENROLLED = "was_enrolled";
     private static final String PREF_LAYOUT_JSON = "cached_layout_json";
@@ -554,6 +555,7 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
                         if (localFiles != null && localFiles.length > 0) {
                             Log.d(TAG, "Offline but previously enrolled - playing " + localFiles.length + " cached files");
                             isEnrolled = true;
+                            reconnectNeeded = true; // flag so we re-sync when network returns
                             // Load cached layout mode and metadata (rotation, fit, grid positions)
                             loadCachedLayoutMetadata();
                             ui.post(() -> {
@@ -591,24 +593,31 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
                 if (responseCode == 200) {
                     // Device is enrolled
                     Log.d(TAG, "Device is enrolled!");
+                    boolean firstEnrollment = !isEnrolled;
                     if (!isEnrolled) {
                         isEnrolled = true;
                         // Persist enrolled state for offline recovery
                         getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit().putBoolean(PREF_WAS_ENROLLED, true).apply();
-                        ui.post(() -> {
-                            // Reset all stale playback state so grid/video initializes fresh
-                            // (like an app restart). This fixes grid not updating after
-                            // deactivate -> reactivate without restarting the app.
+                    }
+                    boolean shouldReconnect = reconnectNeeded;
+                    reconnectNeeded = false;
+                    ui.post(() -> {
+                        if (firstEnrollment) {
+                            // First time enrolled (or re-enrolled after deactivation) — full init
                             resetPlaybackState();
-
                             showEnrollmentOverlay(false);
-                            // Restart poll handler for heartbeats and sync
                             pollHandler.removeCallbacksAndMessages(null);
                             pollHandler.postDelayed(pollRunnable, POLL_MS);
-                            // Now start the video player
                             ensureAllFilesAccessThenStart();
-                        });
-                    }
+                        } else if (shouldReconnect) {
+                            // Network came back after offline boot — restart heartbeat and re-sync
+                            // content/layout so the app reflects current server state.
+                            Log.d(TAG, "Network restored after offline boot — re-syncing with server");
+                            pollHandler.removeCallbacksAndMessages(null);
+                            pollHandler.postDelayed(pollRunnable, 0); // fire immediately to sync mute + status
+                            ensureAllFilesAccessThenStart();
+                        }
+                    });
                 } else if (responseCode == 404) {
                     // Device not found or deactivated - show enrollment screen
                     Log.d(TAG, "Device not enrolled or deactivated (404)");

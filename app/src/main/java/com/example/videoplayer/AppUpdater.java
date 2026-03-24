@@ -175,8 +175,16 @@ public class AppUpdater {
                 }
             }
         };
-        ctx.registerReceiver(downloadReceiver,
-                new IntentFilter(DownloadManager.ACTION_DOWNLOAD_COMPLETE));
+        // Android 13+ requires RECEIVER_EXPORTED for broadcasts sent by system services
+        // (DownloadManager is a system service, so its broadcast comes from outside this process)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            ctx.registerReceiver(downloadReceiver,
+                    new IntentFilter(DownloadManager.ACTION_DOWNLOAD_COMPLETE),
+                    Context.RECEIVER_EXPORTED);
+        } else {
+            ctx.registerReceiver(downloadReceiver,
+                    new IntentFilter(DownloadManager.ACTION_DOWNLOAD_COMPLETE));
+        }
 
         // Poll progress
         pollProgress(dm);

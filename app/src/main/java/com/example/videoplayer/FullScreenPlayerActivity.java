@@ -119,8 +119,8 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
     // ==========================================
 
     // Network timeouts (milliseconds)
-    private static final int CONNECT_TIMEOUT_MS = 30_000;     // 30 seconds for connection
-    private static final int READ_TIMEOUT_MS = 60_000;        // 60 seconds for reading
+    private static final int CONNECT_TIMEOUT_MS = 8_000;      // 8 seconds for connection (fast fallback to cache)
+    private static final int READ_TIMEOUT_MS = 15_000;        // 15 seconds for reading API responses
     private static final int DOWNLOAD_TIMEOUT_MS = 1_800_000; // 30 minutes for large file downloads
     private static final long MIN_STORAGE_REQUIRED_MB = 100; // Minimum 100MB free space required
     private static final long MIN_RAM_REQUIRED_MB = 50;      // Minimum 50MB RAM required

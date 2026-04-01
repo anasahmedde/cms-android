@@ -645,9 +645,32 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
                 }
             } catch (Exception e) {
                 Log.e(TAG, "Enrollment check error: " + e.getMessage());
+                // Server unreachable (timeout, DNS failure, etc.) but internet may be up.
+                // Fall back to cached content exactly like the no-internet path.
+                boolean wasEnrolled = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                        .getBoolean(PREF_WAS_ENROLLED, false);
+                if (wasEnrolled && !isEnrolled) {
+                    File mainDir = ensureMainDir();
+                    File[] localFiles = mainDir.listFiles();
+                    if (localFiles != null && localFiles.length > 0) {
+                        Log.d(TAG, "Server unreachable — falling back to " + localFiles.length + " cached files");
+                        isEnrolled = true;
+                        reconnectNeeded = true;
+                        loadCachedLayoutMetadata();
+                        ui.post(() -> {
+                            showEnrollmentOverlay(false);
+                            if ("single".equals(layoutMode) || layoutMode == null) {
+                                playMixedPlaylist(mainDir);
+                            } else {
+                                switchToGridMode();
+                            }
+                        });
+                        return;
+                    }
+                }
                 ui.post(() -> {
                     if (retryText != null) {
-                        retryText.setText("Connection error. Retrying...");
+                        retryText.setText("Server unreachable. Retrying...");
                     }
                 });
             }
@@ -1150,7 +1173,7 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
                 Log.d(TAG, "Content assignments changed (files already exist), refreshing playback...");
                 lastKnownVideoState = currentState;
                 ui.post(() -> {
-                    toast("Content updated");
+                    toast("Content updated new");
                     if (isGridMode) {
                         switchToGridMode();
                     } else {
@@ -3403,6 +3426,7 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
                 rootContainer.addView(downloadStatusOverlay);
             }
 
+            // NO playMixedPlaylist here — it will be called when surface is ready
             // NO playMixedPlaylist here — it will be called when surface is ready
         }, 300);
     }

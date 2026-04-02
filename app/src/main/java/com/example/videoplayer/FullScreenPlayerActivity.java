@@ -3248,18 +3248,12 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
     }
 
     private void incrementCounts() {
+        // Each endpoint now does an atomic +1 on the server — no read-then-write race condition.
         new Thread(() -> {
             try {
                 String id = getAndroidId();
-                HttpURLConnection c = (HttpURLConnection) new URL(countsUrl(id)).openConnection();
-                c.connect();
-                StringBuilder sb = new StringBuilder();
-                try (BufferedReader br = new BufferedReader(new InputStreamReader(c.getInputStream(), StandardCharsets.UTF_8))) {
-                    String line; while ((line = br.readLine()) != null) sb.append(line);
-                } finally { c.disconnect(); }
-                JSONObject o = new JSONObject(sb.toString());
-                postCount(dailyUpdateUrl(id), "daily_count", o.optInt("daily_count", 0) + 1);
-                postCount(monthlyUpdateUrl(id), "monthly_count", o.optInt("monthly_count", 0) + 1);
+                postCount(dailyUpdateUrl(id), "daily_count", 0);
+                postCount(monthlyUpdateUrl(id), "monthly_count", 0);
             } catch (Exception ignored) {}
         }).start();
     }

@@ -15,8 +15,40 @@
         android:name="android.permission.MANAGE_EXTERNAL_STORAGE"
         tools:ignore="ScopedStorage" />
 
-    <!-- Start app on boot -->
+    <!-- ═══════════════════════════════════════════════════════════════════════
+         BOOT AUTO-START PERMISSIONS
+         ═══════════════════════════════════════════════════════════════════════ -->
+
+    <!-- Receive BOOT_COMPLETED broadcast -->
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+
+    <!-- Foreground service (required on Android 8+) -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SHORT_SERVICE"
+        tools:targetApi="34" />
+
+    <!-- Wake lock: keep CPU + screen alive during boot-launch chain -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+    <!-- Full-screen intent: launch activity from lock screen / screen-off
+         (same mechanism as alarm/phone apps). Auto-granted on install. -->
+    <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
+
+    <!-- Dismiss keyguard to show above lock screen -->
+    <uses-permission android:name="android.permission.DISABLE_KEYGUARD" />
+
+    <!-- Exact alarm fallback for boot launch (Android 12+ requires this) -->
+    <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM"
+        android:maxSdkVersion="32" />
+    <!-- Android 13+ renamed the permission -->
+    <uses-permission android:name="android.permission.USE_EXACT_ALARM"
+        tools:targetApi="33" />
+
+    <!-- Notifications (Android 13+ requires runtime permission, but declaring
+         it here auto-grants it on upgrade from pre-13 installs) -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!-- ═══════════════════════════════════════════════════════════════════════ -->
 
     <!-- Self-update: install downloaded APKs -->
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
@@ -64,12 +96,34 @@
         android:requestLegacyExternalStorage="true"
         android:theme="@style/Theme.AppCompat.Light.NoActionBar">
 
-        <!-- Main activity with sensor-based orientation for TV/mobile compatibility -->
+        <!--
+            Main activity.
+            ════════════════════════════════════════════════════════════════════
+            • launchMode="singleTask" — prevents duplicate instances when the
+              boot service, alarm, AND full-screen intent all try to start it
+              at the same time.  Without this, multiple instances race and the
+              loser shows a white screen then dies.
+
+            • showWhenLocked / turnScreenOn — XML attributes (API 27+) that
+              tell the system to show this activity above the lock screen and
+              wake the display.  Also set programmatically in onCreate for
+              older devices.
+
+            • theme with black windowBackground — eliminates the white flash
+              between the window being created and setContentView()/layout
+              rendering.  This is the single biggest visual fix.
+            ════════════════════════════════════════════════════════════════════
+        -->
         <activity
             android:name=".FullScreenPlayerActivity"
             android:exported="true"
             android:screenOrientation="sensorPortrait"
-            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden">
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden"
+            android:showOnLockScreen="true"
+            android:showWhenLocked="true"
+            android:turnScreenOn="true"
+            android:launchMode="singleTask"
+            android:theme="@style/Theme.DGXPlayer.Black">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
@@ -88,6 +142,11 @@
                 android:name="android.support.FILE_PROVIDER_PATHS"
                 android:resource="@xml/file_paths" />
         </provider>
+
+        <service
+            android:name=".BootLaunchService"
+            android:exported="false"
+            android:foregroundServiceType="shortService" />
 
         <receiver
             android:name=".BootReceiver"

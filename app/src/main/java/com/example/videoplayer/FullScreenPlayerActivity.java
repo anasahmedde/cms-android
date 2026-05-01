@@ -113,8 +113,8 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
     // ==========================================
     // BACKEND URL CONFIGURATION - CHANGE THIS
     // ==========================================
-     // private static final String API_BASE = "https://api-cms.wizioners.com";
-     private static final String API_BASE = "https://api-staging-cms.wizioners.com";
+    private static final String API_BASE = "https://api-cms.wizioners.com";
+    //private static final String API_BASE = "https://api-staging-cms.wizioners.com";
 
     // ==========================================
 
@@ -293,8 +293,26 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
 
     @Override
     protected void onCreate(@Nullable Bundle savedInstanceState) {
+        // Force black background BEFORE super.onCreate to eliminate white flash on boot
+        getWindow().setBackgroundDrawableResource(android.R.color.black);
+
         super.onCreate(savedInstanceState);
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+
+        // At boot the screen is OFF and the lock screen is active.
+        // Without these flags the activity starts but is invisible — Android
+        // treats it as a background process and kills it within ~2 seconds.
+        // FLAG_SHOW_WHEN_LOCKED : display above the keyguard/lock screen
+        // FLAG_TURN_SCREEN_ON   : wake the display if it is off
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
+            setShowWhenLocked(true);
+            setTurnScreenOn(true);
+        } else {
+            getWindow().addFlags(
+                    WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED |
+                            WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON);
+        }
+
         setContentView(R.layout.activity_fullscreen_player);
 
         // Detect if running on Android TV
@@ -426,6 +444,16 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
         }
         // Clear the in-progress flag so switchToGridMode isn't permanently blocked
         gridSwitchInProgress = false;
+    }
+
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        Log.d(TAG, "onNewIntent — activity re-launched (singleTask)");
+        // No extra action needed — onResume() will run next and resume playback.
+        // This handler is required because with launchMode="singleTask",
+        // re-launches call onNewIntent+onResume instead of onCreate.
     }
 
     @Override

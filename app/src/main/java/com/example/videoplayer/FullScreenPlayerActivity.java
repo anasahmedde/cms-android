@@ -68,6 +68,10 @@ import android.widget.Button;
 import android.widget.FrameLayout;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
+import android.graphics.Color;
+import android.graphics.Typeface;
+import android.view.Gravity;
+import android.util.TypedValue;
 import android.widget.TextView;
 import android.widget.Toast;
 import android.content.ClipboardManager;
@@ -145,6 +149,10 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
     private TextView deviceIdText;
     private TextView retryText;
     private Button copyButton;
+    // Optional device-specific header (text) / footer (image)
+    private TextView headerBar;
+    private ImageView footerBar;
+    private volatile String lastFooterSig = null;
     private volatile boolean isEnrolled = false;
     private volatile boolean reconnectNeeded = false; // true when offline boot path ran; triggers re-sync on reconnect
     private ReedCountStore reedCountStore;
@@ -356,6 +364,8 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
         deviceIdText = findViewById(R.id.deviceIdText);
         retryText = findViewById(R.id.retryText);
         copyButton = findViewById(R.id.copyButton);
+        headerBar = findViewById(R.id.headerBar);
+        footerBar = findViewById(R.id.footerBar);
 
         // Set device ID in the overlay
         String deviceId = getAndroidId();
@@ -939,6 +949,142 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
                 if (gp != null) try { gp.setVolume(vol); } catch (Exception ignored) {}
             }
         });
+    }
+
+    // ===== HEADER / FOOTER (device-specific, optional) =====
+    // Config comes from the heartbeat JSON (null-safe — renders only when present):
+    //   header_enabled (bool), header_text (string)
+    //   footer_enabled (bool), footer_image_url (S3 presigned image URL)
+    private void applyHeaderFooter(JSONObject json) {
+        final boolean headerEnabled = json.optBoolean("header_enabled", false);
+        final String headerText = json.isNull("header_text") ? "" : json.optString("header_text", "");
+        final boolean footerEnabled = json.optBoolean("footer_enabled", false);
+        final String footerUrl = json.isNull("footer_image_url") ? "" : json.optString("footer_image_url", "");
+
+        // Styling (colors, font, size, rotation, fit, ...) as one JSON blob
+        JSONObject style = null;
+        try {
+            String raw = json.isNull("header_footer_style") ? null : json.optString("header_footer_style", null);
+            if (raw != null && raw.trim().length() > 0) style = new JSONObject(raw);
+        } catch (Exception ignored) {}
+        final JSONObject headerStyle = style != null ? style.optJSONObject("header") : null;
+        final JSONObject footerStyle = style != null ? style.optJSONObject("footer") : null;
+
+        // Header = text
+        ui.post(() -> {
+            if (headerBar != null) {
+                if (headerEnabled && headerText.trim().length() > 0) {
+                    headerBar.setText(headerText);
+                    applyHeaderStyle(headerStyle);
+                    headerBar.setVisibility(View.VISIBLE);
+                } else {
+                    headerBar.setVisibility(View.GONE);
+                }
+            }
+        });
+
+        // Footer = image
+        if (footerBar != null) {
+            if (footerEnabled && footerUrl.trim().length() > 0) {
+                ui.post(() -> applyFooterStyle(footerStyle));
+                loadFooterImage(footerUrl.trim());
+            } else {
+                lastFooterSig = null;
+                ui.post(() -> { footerBar.setImageDrawable(null); footerBar.setVisibility(View.GONE); });
+            }
+        }
+    }
+
+    private int parseColor(String hex, int fallback) {
+        try { return Color.parseColor(hex); } catch (Exception e) { return fallback; }
+    }
+
+    private int dpToPx(int dp) {
+        return (int) (dp * getResources().getDisplayMetrics().density);
+    }
+
+    private void applyHeaderStyle(JSONObject s) {
+        if (headerBar == null) return;
+        if (s == null) s = new JSONObject();
+        headerBar.setBackgroundColor(parseColor(s.optString("bgColor", "#000000"), Color.parseColor("#CC000000")));
+        headerBar.setTextColor(parseColor(s.optString("textColor", "#FFFFFF"), Color.WHITE));
+        headerBar.setTextSize(TypedValue.COMPLEX_UNIT_SP, (float) s.optDouble("fontSize", 22));
+
+        String fam = s.optString("fontFamily", "sans");
+        Typeface base = "serif".equals(fam) ? Typeface.SERIF
+                      : "monospace".equals(fam) ? Typeface.MONOSPACE : Typeface.SANS_SERIF;
+        headerBar.setTypeface(base, s.optBoolean("bold", false) ? Typeface.BOLD : Typeface.NORMAL);
+
+        String align = s.optString("align", "center");
+        int g = "left".equals(align) ? Gravity.START : "right".equals(align) ? Gravity.END : Gravity.CENTER_HORIZONTAL;
+        headerBar.setGravity(g | Gravity.CENTER_VERTICAL);
+
+        headerBar.setRotation((float) s.optInt("rotation", 0));
+    }
+
+    private void applyFooterStyle(JSONObject s) {
+        if (footerBar == null) return;
+        if (s == null) s = new JSONObject();
+        footerBar.setBackgroundColor(parseColor(s.optString("bgColor", "#000000"), Color.parseColor("#CC000000")));
+
+        int h = s.optInt("heightDp", 80);
+        LinearLayout.LayoutParams lp = (footerBar.getLayoutParams() instanceof LinearLayout.LayoutParams)
+                ? (LinearLayout.LayoutParams) footerBar.getLayoutParams()
+                : new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dpToPx(h));
+        lp.width = LinearLayout.LayoutParams.MATCH_PARENT;
+        lp.height = dpToPx(h);
+        footerBar.setLayoutParams(lp);
+
+        String fit = s.optString("scaleType", "fit");
+        footerBar.setScaleType("fill".equals(fit) ? ImageView.ScaleType.FIT_XY
+                : "center".equals(fit) ? ImageView.ScaleType.CENTER_INSIDE
+                : ImageView.ScaleType.FIT_CENTER);
+
+        footerBar.setRotation((float) s.optInt("rotation", 0));
+    }
+
+    private void loadFooterImage(final String url) {
+        // Presigned URLs change their query string each heartbeat; key on the path only
+        // so we don't re-download the same image every time.
+        final String cacheKey = url.contains("?") ? url.substring(0, url.indexOf('?')) : url;
+        if (cacheKey.equals(lastFooterSig)) {
+            ui.post(() -> footerBar.setVisibility(View.VISIBLE));
+            return;
+        }
+        lastFooterSig = cacheKey;
+        new Thread(() -> {
+            final Bitmap b = downloadImage(url, cacheKey);
+            ui.post(() -> {
+                if (b != null) {
+                    footerBar.setImageBitmap(b);
+                    footerBar.setVisibility(View.VISIBLE);
+                } else {
+                    footerBar.setVisibility(View.GONE);
+                }
+            });
+        }).start();
+    }
+
+    // Download (and cache locally, so it survives offline) an image and decode it.
+    private Bitmap downloadImage(String url, String cacheKey) {
+        try {
+            File dir = new File(getFilesDir(), "hf");
+            if (!dir.exists()) dir.mkdirs();
+            File f = new File(dir, Integer.toHexString(cacheKey.hashCode()) + ".img");
+            if (!f.exists() || f.length() == 0) {
+                HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
+                c.setConnectTimeout(CONNECT_TIMEOUT_MS);
+                c.setReadTimeout(READ_TIMEOUT_MS);
+                try (InputStream in = c.getInputStream(); FileOutputStream out = new FileOutputStream(f)) {
+                    byte[] buf = new byte[8192]; int n;
+                    while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
+                } finally { c.disconnect(); }
+            }
+            return BitmapFactory.decodeFile(f.getAbsolutePath());
+        } catch (Exception e) {
+            Log.w(TAG, "header image load failed: " + url, e);
+            return null;
+        }
     }
 
     // ===== ROTATION POLLING =====
@@ -2049,7 +2195,10 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
                 // Cache BLE device ID set by admin in web dashboard
                 String bleId = json.isNull("ble_device_id") ? "" : json.optString("ble_device_id", "");
                 getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
-                    .putString(PREF_BLE_DEVICE_ID, bleId).apply();
+                        .putString(PREF_BLE_DEVICE_ID, bleId).apply();
+
+                // Apply optional device-specific header (text) / footer (images)
+                applyHeaderFooter(json);
 
                 // Check if company expired
                 if (json.optBoolean("company_expired", false)) {
@@ -3365,7 +3514,7 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
         if (lower.startsWith("id:")) {
             String receivedId = cmd.substring(3).trim();
             String savedId = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
-                                 .getString(PREF_BLE_DEVICE_ID, "").trim();
+                    .getString(PREF_BLE_DEVICE_ID, "").trim();
             bleAuthPending = false;
             if (!savedId.isEmpty() && !receivedId.equals(savedId)) {
                 Log.w(TAG, "BLE auth FAILED — expected '" + savedId + "' got '" + receivedId + "' — disconnecting");

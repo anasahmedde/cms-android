@@ -36,6 +36,7 @@ import android.bluetooth.le.BluetoothLeScanner;
 import android.bluetooth.le.ScanCallback;
 import android.bluetooth.le.ScanFilter;
 import android.bluetooth.le.ScanResult;
+import android.os.ParcelUuid;
 import android.bluetooth.le.ScanSettings;
 import android.content.Intent;
 import android.content.pm.PackageManager;
@@ -113,8 +114,8 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
     // ==========================================
     // BACKEND URL CONFIGURATION - CHANGE THIS
     // ==========================================
-    private static final String API_BASE = "https://api-cms.wizioners.com";
-    //private static final String API_BASE = "https://api-staging-cms.wizioners.com";
+    //private static final String API_BASE = "https://api-cms.wizioners.com";
+    private static final String API_BASE = "https://api-staging-cms.wizioners.com";
 
     // ==========================================
 
@@ -146,10 +147,12 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
     private Button copyButton;
     private volatile boolean isEnrolled = false;
     private volatile boolean reconnectNeeded = false; // true when offline boot path ran; triggers re-sync on reconnect
+    private ReedCountStore reedCountStore;
     private static final String PREFS_NAME = "digix_player_prefs";
     private static final String PREF_WAS_ENROLLED = "was_enrolled";
     private static final String PREF_LAYOUT_JSON = "cached_layout_json";
     private static final String PREF_IS_MUTED = "is_muted";
+    private static final String PREF_BLE_DEVICE_ID = "ble_device_id";
     private static final long ENROLLMENT_CHECK_MS = 15_000L; // Check every 15 seconds
     private final Handler enrollmentCheckHandler = new Handler(Looper.getMainLooper());
     private final Runnable enrollmentCheckRunnable = new Runnable() {
@@ -238,7 +241,6 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
         }
     };
 
-    // Video download polling every 60 seconds
     private static final long POLL_MS = 30_000L; // 30 seconds heartbeat
     private final Handler pollHandler = new Handler(Looper.getMainLooper());
     private final Runnable pollRunnable = new Runnable() {
@@ -264,6 +266,7 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
 
     // BLE
     private static final String ESP32_DEVICE_NAME = "ESP32_PLAYER_CTRL_BLE";
+    private volatile String bleTargetName = null;  // "ESP32_PLAYER_CTRL_BLE_<id>" — only connect to this exact name
     private static final int REQ_BT_PERMS = 2001;
     private static final UUID NUS_SERVICE_UUID = UUID.fromString("6E400001-B5A3-F393-E0A9-E50E24DCCA9E");
     private static final UUID NUS_CHAR_RX_UUID = UUID.fromString("6E400002-B5A3-F393-E0A9-E50E24DCCA9E");
@@ -277,6 +280,9 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
     private final Handler bleHandler = new Handler(Looper.getMainLooper());
     private volatile boolean btShouldReconnect = true;
     private volatile boolean bleScanning = false;
+    private volatile boolean bleConnected = false;
+    private volatile boolean bleAuthPending = false;
+    private final Runnable reconnectRunnable = this::autoConnectToEsp32;
 
     private static final Pattern TEMP_PATTERN = Pattern.compile("(-?\\d+(?:\\.\\d+)?)");
     private volatile Float lastTemperatureValue = null;
@@ -387,6 +393,10 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
         appUpdater.checkForUpdate();
         UpdateCheckWorker.schedule(this);
 
+        // Reed count buffer — flush any counts saved while offline in a previous session
+        reedCountStore = new ReedCountStore(this);
+        ReedSyncWorker.enqueue(this);
+
         btAdapter = BluetoothAdapter.getDefaultAdapter();
         if (btAdapter != null) ensureBluetoothPermissionAndConnect();
     }
@@ -474,6 +484,8 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
         }
         rotationPollHandler.removeCallbacksAndMessages(null);
         rotationPollHandler.postDelayed(rotationPollRunnable, 1000);
+        tempHandler.removeCallbacksAndMessages(null);
+        tempHandler.postDelayed(tempPostRunnable, TEMP_POST_INTERVAL_MS);
     }
 
     @Override
@@ -486,8 +498,14 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
         imageTimerHandler.removeCallbacksAndMessages(null);
         transitionWatcherHandler.removeCallbacksAndMessages(null);
         btShouldReconnect = false;
+        bleConnected = false;
+        bleHandler.removeCallbacksAndMessages(null);
         stopBleScan();
-        if (btGatt != null) { try { btGatt.close(); } catch (Exception ignored) {} }
+        if (btGatt != null) {
+            try { btGatt.disconnect(); } catch (Exception ignored) {}
+            try { btGatt.close(); } catch (Exception ignored) {}
+            btGatt = null;
+        }
         if (player != null) {
             try {
                 player.setVideoSurface(null);
@@ -2028,6 +2046,11 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
                 // Apply mute/unmute from dashboard setting
                 applyMuteToAllPlayers(json.optBoolean("is_muted", false));
 
+                // Cache BLE device ID set by admin in web dashboard
+                String bleId = json.isNull("ble_device_id") ? "" : json.optString("ble_device_id", "");
+                getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
+                    .putString(PREF_BLE_DEVICE_ID, bleId).apply();
+
                 // Check if company expired
                 if (json.optBoolean("company_expired", false)) {
                     Log.d(TAG, "Company subscription expired");
@@ -3175,6 +3198,13 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
                 ActivityCompat.requestPermissions(this, new String[]{Manifest.permission.BLUETOOTH_CONNECT, Manifest.permission.BLUETOOTH_SCAN}, REQ_BT_PERMS);
                 return;
             }
+        } else {
+            // Android 6–11: BLE scan returns NOTHING without ACCESS_FINE_LOCATION granted at runtime.
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
+                Log.w(TAG, "BLE: requesting ACCESS_FINE_LOCATION (required for scan on Android <= 11)");
+                ActivityCompat.requestPermissions(this, new String[]{Manifest.permission.ACCESS_FINE_LOCATION}, REQ_BT_PERMS);
+                return;
+            }
         }
         autoConnectToEsp32();
     }
@@ -3190,52 +3220,135 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
     }
 
     private void autoConnectToEsp32() {
-        if (btAdapter == null || !btAdapter.isEnabled()) return;
+        if (btAdapter == null) { Log.d(TAG, "BLE: no adapter"); return; }
+        if (!btAdapter.isEnabled()) {
+            // Bluetooth may still be initialising (e.g. right after boot). Retry in 3 s.
+            Log.d(TAG, "BLE: adapter disabled, retrying in 3s");
+            if (btShouldReconnect) bleHandler.postDelayed(this::autoConnectToEsp32, 3_000L);
+            return;
+        }
         BluetoothManager bm = (BluetoothManager) getSystemService(BLUETOOTH_SERVICE);
         if (bm != null) btAdapter = bm.getAdapter();
         bleScanner = btAdapter.getBluetoothLeScanner();
         if (bleScanner != null) startBleScan();
+        else Log.d(TAG, "BLE: no LE scanner");
     }
 
     private void startBleScan() {
-        if (bleScanner == null || bleScanning) return;
+        if (bleScanner == null || bleScanning || bleConnected) return;
+        // Only connect to the ESP32 whose ID matches the one configured for THIS phone.
+        // No ID configured = this phone has no ESP32 paired → don't scan, so it can never
+        // grab another device's ESP32 connection slot. Retry later in case the ID arrives via heartbeat.
+        String savedId = getSharedPreferences(PREFS_NAME, MODE_PRIVATE).getString(PREF_BLE_DEVICE_ID, "").trim();
+        if (savedId.isEmpty()) {
+            Log.d(TAG, "No BLE device ID configured — skipping ESP32 scan");
+            scheduleBleReconnect();
+            return;
+        }
+        bleTargetName = ESP32_DEVICE_NAME + "_" + savedId;
         bleScanning = true;
-        List<ScanFilter> f = new ArrayList<>(); f.add(new ScanFilter.Builder().setDeviceName(ESP32_DEVICE_NAME).build());
-        bleScanner.startScan(f, new ScanSettings.Builder().setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY).build(), scanCallback);
-        bleHandler.postDelayed(() -> { if (bleScanning) { stopBleScan(); scheduleBleReconnect(); } }, 15_000L);
+        Log.d(TAG, "BLE: scanning (no filter) for '" + bleTargetName + "'");
+        // Scan with NO filter and match the name in software. Hardware-offloaded scan
+        // filters (APCF) on some chipsets (incl. this AIC part) silently drop everything,
+        // especially 128-bit service UUIDs. No filter = the stack reports every device,
+        // so we always see the ESP32 if it is advertising. Fine for a foreground app.
+        bleScanner.startScan(null, new ScanSettings.Builder().setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY).build(), scanCallback);
+        bleHandler.postDelayed(() -> { if (bleScanning) { Log.d(TAG, "BLE: scan timeout, no '" + bleTargetName + "' found — retrying"); stopBleScan(); scheduleBleReconnect(); } }, 15_000L);
     }
 
     private void stopBleScan() { if (bleScanning && bleScanner != null) { try { bleScanner.stopScan(scanCallback); } catch (Exception ignored) {} bleScanning = false; } }
-    private void scheduleBleReconnect() { if (btShouldReconnect) bleHandler.postDelayed(this::autoConnectToEsp32, 5_000L); }
+
+    // Dedupe reconnect attempts — without this, a scan timeout + a disconnect can
+    // queue several autoConnect calls and run overlapping scans, which itself makes
+    // connecting flaky. Always cancel any pending attempt before scheduling a new one.
+    private void scheduleBleReconnect() {
+        if (!btShouldReconnect) return;
+        bleHandler.removeCallbacks(reconnectRunnable);
+        bleHandler.postDelayed(reconnectRunnable, 2_000L);
+    }
+
+    // Connect on the MAIN thread with explicit LE transport. Calling connectGatt from
+    // the scan-callback (binder) thread or without TRANSPORT_LE are the two classic
+    // causes of the Android "status 133" failure that makes connecting slow/unreliable.
+    private void connectToDevice(final BluetoothDevice dev) {
+        bleHandler.postDelayed(() -> {
+            if (!btShouldReconnect || bleConnected) return;
+            try {
+                if (btGatt != null) { try { btGatt.close(); } catch (Exception ignored) {} btGatt = null; }
+                Log.d(TAG, "BLE: connecting to '" + dev.getName() + "' (" + dev.getAddress() + ")");
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                    btGatt = dev.connectGatt(FullScreenPlayerActivity.this, false, gattCallback, BluetoothDevice.TRANSPORT_LE);
+                } else {
+                    btGatt = dev.connectGatt(FullScreenPlayerActivity.this, false, gattCallback);
+                }
+            } catch (Exception e) { Log.w(TAG, "BLE: connectGatt failed", e); scheduleBleReconnect(); }
+        }, 200L);  // brief gap after stopScan so the BLE stack settles before connecting
+    }
 
     private final ScanCallback scanCallback = new ScanCallback() {
         @Override public void onScanResult(int t, ScanResult r) {
             BluetoothDevice dev = r.getDevice();
-            if (dev != null && ESP32_DEVICE_NAME.equals(dev.getName())) {
+            if (dev == null) return;
+            // Name may come from the scan record (adv data) even when dev.getName() is null
+            String advName = (r.getScanRecord() != null) ? r.getScanRecord().getDeviceName() : null;
+            String name = (dev.getName() != null) ? dev.getName() : advName;
+            Log.d(TAG, "BLE: saw device name='" + name + "' addr=" + dev.getAddress() + " (target='" + bleTargetName + "')");
+            String target = bleTargetName;
+            if (target != null && target.equals(name)) {
+                Log.d(TAG, "BLE: MATCH — connecting");
                 stopBleScan();
-                try { btGatt = dev.connectGatt(FullScreenPlayerActivity.this, false, gattCallback); } catch (Exception e) { scheduleBleReconnect(); }
+                connectToDevice(dev);
             }
         }
-        @Override public void onScanFailed(int e) { scheduleBleReconnect(); }
+        @Override public void onScanFailed(int e) { Log.w(TAG, "BLE: scan failed, code=" + e); bleScanning = false; scheduleBleReconnect(); }
     };
 
     private final BluetoothGattCallback gattCallback = new BluetoothGattCallback() {
         @Override public void onConnectionStateChange(BluetoothGatt g, int s, int n) {
-            if (n == BluetoothGatt.STATE_CONNECTED) { try { g.discoverServices(); } catch (Exception ignored) {} }
-            else if (n == BluetoothGatt.STATE_DISCONNECTED) { try { g.close(); } catch (Exception ignored) {} scheduleBleReconnect(); }
+            Log.d(TAG, "BLE: connState status=" + s + " newState=" + n);
+            if (n == BluetoothGatt.STATE_CONNECTED && s == BluetoothGatt.GATT_SUCCESS) {
+                bleConnected = true;
+                bleHandler.removeCallbacks(reconnectRunnable);  // cancel any stale retry
+                // brief settle delay before service discovery improves reliability
+                bleHandler.postDelayed(() -> { try { g.discoverServices(); } catch (Exception ignored) {} }, 300L);
+            } else {
+                // Disconnected OR a connection error (e.g. status 133) — always close and retry.
+                bleConnected = false;
+                try { g.close(); } catch (Exception ignored) {}
+                if (btGatt == g) btGatt = null;
+                scheduleBleReconnect();
+            }
         }
         @Override public void onServicesDiscovered(BluetoothGatt g, int s) {
+            Log.d(TAG, "BLE: servicesDiscovered status=" + s);
             if (s != BluetoothGatt.GATT_SUCCESS) { scheduleBleReconnect(); return; }
             BluetoothGattService svc = g.getService(NUS_SERVICE_UUID);
-            if (svc == null) { scheduleBleReconnect(); return; }
+            if (svc == null) { Log.w(TAG, "BLE: NUS service not found"); scheduleBleReconnect(); return; }
             nusTxChar = svc.getCharacteristic(NUS_CHAR_TX_UUID);
             nusRxChar = svc.getCharacteristic(NUS_CHAR_RX_UUID);
-            if (nusTxChar == null || nusRxChar == null) { scheduleBleReconnect(); return; }
+            if (nusTxChar == null || nusRxChar == null) { Log.w(TAG, "BLE: NUS chars not found"); scheduleBleReconnect(); return; }
             try {
                 g.setCharacteristicNotification(nusTxChar, true);
                 BluetoothGattDescriptor d = nusTxChar.getDescriptor(CCCD_UUID);
                 if (d != null) { d.setValue(BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE); g.writeDescriptor(d); }
             } catch (Exception e) { scheduleBleReconnect(); }
+            // AUTH is sent in onDescriptorWrite after CCCD write is confirmed
+        }
+        @Override public void onDescriptorWrite(BluetoothGatt g, BluetoothGattDescriptor d, int status) {
+            if (!CCCD_UUID.equals(d.getUuid())) return;
+            // CCCD write done — now safe to send the AUTH command (no pending GATT op conflict)
+            String savedId = getSharedPreferences(PREFS_NAME, MODE_PRIVATE).getString(PREF_BLE_DEVICE_ID, "").trim();
+            Log.d(TAG, "BLE: notifications enabled, savedId='" + savedId + "' — sending AUTH");
+            if (!savedId.isEmpty()) {
+                bleAuthPending = true;
+                bleHandler.postDelayed(() -> {
+                    if (bleAuthPending) {
+                        Log.w(TAG, "BLE auth timeout — disconnecting");
+                        if (btGatt != null) btGatt.disconnect();
+                    }
+                }, 5000);
+                sendToEsp32("AUTH");
+            }
         }
         @Override public void onCharacteristicChanged(BluetoothGatt g, BluetoothGattCharacteristic c) {
             if (!NUS_CHAR_TX_UUID.equals(c.getUuid())) return;
@@ -3247,6 +3360,22 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
 
     private void handleBtCommand(String cmd) {
         String lower = cmd.toLowerCase(Locale.US);
+
+        // BLE auth response: "ID:01"
+        if (lower.startsWith("id:")) {
+            String receivedId = cmd.substring(3).trim();
+            String savedId = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                                 .getString(PREF_BLE_DEVICE_ID, "").trim();
+            bleAuthPending = false;
+            if (!savedId.isEmpty() && !receivedId.equals(savedId)) {
+                Log.w(TAG, "BLE auth FAILED — expected '" + savedId + "' got '" + receivedId + "' — disconnecting");
+                if (btGatt != null) btGatt.disconnect();
+            } else {
+                Log.d(TAG, "BLE auth OK — '" + receivedId + "' matches — connection established");
+            }
+            return;
+        }
+
         if (lower.contains("temperature")) {
             Matcher m = TEMP_PATTERN.matcher(cmd);
             if (m.find()) try { lastTemperatureValue = Float.parseFloat(m.group(1)); } catch (Exception ignored) {}
@@ -3259,6 +3388,16 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
                 case "NEXT": if (player != null && player.getMediaItemCount() > 0) { player.seekTo((player.getCurrentMediaItemIndex()+1) % player.getMediaItemCount(), 0); player.play(); } break;
             }
         });
+    }
+
+    /** Write a command string to the ESP32 RX characteristic (Android → ESP32). */
+    @SuppressLint("MissingPermission")
+    private void sendToEsp32(String cmd) {
+        if (nusRxChar == null || btGatt == null) return;
+        try {
+            nusRxChar.setValue((cmd + "\n").getBytes(StandardCharsets.UTF_8));
+            btGatt.writeCharacteristic(nusRxChar);
+        } catch (Exception ignored) {}
     }
 
     private void sendTemperatureToServer(float t) {
@@ -3276,24 +3415,44 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
     }
 
     private void incrementCounts() {
-        // Each endpoint now does an atomic +1 on the server — no read-then-write race condition.
+        // 1. Persist locally first — survives offline periods, reboots, and crashes.
+        reedCountStore.recordOpen();
+
+        // 2. Try to flush to the server immediately on a background thread.
+        //    If the POST fails (offline), the count stays in the local buffer.
+        //    ReedSyncWorker will drain the buffer the next time network is available.
         new Thread(() -> {
-            try {
-                String id = getAndroidId();
-                postCount(dailyUpdateUrl(id), "daily_count", 0);
-                postCount(monthlyUpdateUrl(id), "monthly_count", 0);
-            } catch (Exception ignored) {}
+            String id       = getAndroidId();
+            boolean dailyOk = tryPostCount(dailyUpdateUrl(id),   "daily_count");
+            boolean mthlyOk = tryPostCount(monthlyUpdateUrl(id), "monthly_count");
+            if (dailyOk)  reedCountStore.decrementDaily();
+            if (mthlyOk)  reedCountStore.decrementMonthly();
+            if (!dailyOk || !mthlyOk) ReedSyncWorker.enqueue(FullScreenPlayerActivity.this);
         }).start();
+    }
+
+    /** Returns true if the POST succeeded (2xx), false on any error or non-2xx status. */
+    private boolean tryPostCount(String url, String key) {
+        try {
+            postCount(url, key, 0);
+            return true;
+        } catch (Exception e) {
+            return false;
+        }
     }
 
     private void postCount(String url, String key, int val) throws Exception {
         HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
+        c.setConnectTimeout(CONNECT_TIMEOUT_MS);
+        c.setReadTimeout(READ_TIMEOUT_MS);
         c.setRequestMethod("POST"); c.setDoOutput(true);
         c.setRequestProperty("Content-Type", "application/json; charset=UTF-8");
         try (DataOutputStream out = new DataOutputStream(c.getOutputStream())) {
             out.write(("{\"" + key + "\": " + val + "}").getBytes(StandardCharsets.UTF_8));
         }
-        c.getResponseCode(); c.disconnect();
+        int code = c.getResponseCode();
+        c.disconnect();
+        if (code < 200 || code >= 300) throw new Exception("HTTP " + code);
     }
 
     // ===== GRID MODE METHODS =====

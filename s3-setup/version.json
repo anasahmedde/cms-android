@@ -1,10 +1,8 @@
 {
-  "versionCode": 7,
-  "versionName": "7.0.4",
-  "apkUrl": "https://dgx-release-bucket.s3.us-east-2.amazonaws.com/releases/app-v7.0.4.apk",
-  "checksum": "eac333ebfbb8f667f934d4530bb6bd22531fa9a0dcbb4ac2148a38f8700a0ce5",
-  "releaseNotes": "Version 7.0.4",
+  "versionCode": 9,
+  "versionName": "9.0.0",
+  "apkUrl": "https://dgx-release-bucket.s3.us-east-2.amazonaws.com/releases/app-v9.0.0.apk",
+  "checksum": "705da3881e5d6e0611994bb8c4909c3f8e1bba79a229ffa4ef912d9ba445ff2d",
+  "releaseNotes": "Screen templates: devices render a company's linked screen template (header/QR/media/text zones + playlist). Adds app-version reporting.",
   "forceUpdate": false
 }
-
-

@@ -61,6 +61,8 @@ import android.util.Log;
 import android.view.Surface;
 import android.view.TextureView;
 import android.view.View;
+import android.view.ViewGroup;
+import android.content.pm.ActivityInfo;
 import android.view.WindowInsets;
 import android.view.WindowInsetsController;
 import android.view.WindowManager;
@@ -270,6 +272,18 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
     private ExoPlayer player;
     private Surface surface;
     private final Handler ui = new Handler(Looper.getMainLooper());
+
+    // Screen templates: when the device's company has a linked template, we render
+    // a transparent zone overlay on top and confine the existing single-mode
+    // playback to the template's "playlist" zone. templateActive gates the normal
+    // full-screen single/grid playback so the two don't fight.
+    private static final String PREF_TEMPLATE_JSON = "cached_template_json";
+    private TemplateRenderer templateRenderer;
+    private FrameLayout templateOverlay;
+    private volatile boolean templateActive = false;
+    private volatile String templateStamp = null;
+    private final java.util.concurrent.atomic.AtomicBoolean templateFetchInProgress =
+            new java.util.concurrent.atomic.AtomicBoolean(false);
     private ActivityResultLauncher<String> legacyPermLauncher;
 
     // BLE
@@ -634,6 +648,8 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
                                 } else {
                                     switchToGridMode();
                                 }
+                                // Offline: render the last cached template over playback.
+                                loadCachedTemplateIfAny();
                             });
                             return;
                         }
@@ -677,6 +693,9 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
                             pollHandler.removeCallbacksAndMessages(null);
                             pollHandler.postDelayed(pollRunnable, POLL_MS);
                             ensureAllFilesAccessThenStart();
+                            // Paint the template immediately rather than waiting for
+                            // the first 30s heartbeat.
+                            fetchAndApplyTemplate(templateStamp);
                         } else if (shouldReconnect) {
                             // Network came back after offline boot — restart heartbeat and re-sync
                             // content/layout so the app reflects current server state.
@@ -720,6 +739,8 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
                             } else {
                                 switchToGridMode();
                             }
+                            // Offline: render the last cached template over the playback.
+                            loadCachedTemplateIfAny();
                         });
                         return;
                     }
@@ -1176,7 +1197,11 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
                         final boolean layoutAlsoChanged = layoutChanged;
                         ui.post(() -> {
                             setDownloadingOverlay(false);
-                            if (layoutAlsoChanged) {
+                            if (templateActive) {
+                                // Template mode: single-mode playback confined to the
+                                // playlist zone (textureView is sized to that rect).
+                                playMixedPlaylist(mainDir);
+                            } else if (layoutAlsoChanged) {
                                 // Layout changed during the sync window — do a proper switch
                                 if ("single".equals(currentLayoutMode) || currentLayoutMode == null) {
                                     switchToSingleMode();
@@ -1203,6 +1228,14 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
 
                 // Check if there are videos we don't have locally - trigger download
                 checkForMissingVideosAndDownload(byFile);
+
+                // Template mode: content still downloads (above), but playback stays
+                // confined to the template's playlist zone in single-mode — never
+                // switch to full-screen grid, which would fight the overlay.
+                if (templateActive) {
+                    ui.post(() -> { if (!isGridMode) applyRotationForCurrentVideo(); });
+                    return;
+                }
 
                 // If layout changed, switch between single and grid mode
                 if (layoutChanged) {
@@ -2157,8 +2190,11 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
         c.setRequestProperty("Content-Type", "application/json; charset=UTF-8");
 
         try (DataOutputStream out = new DataOutputStream(c.getOutputStream())) {
+            // Include app_version so the fleet is visible in the dashboard (heartbeat
+            // is the only signal that reaches every device).
             String body = "{\"is_online\": true, \"resolution\": \""
-                    + screenWidth + "x" + screenHeight + "\"}";
+                    + screenWidth + "x" + screenHeight + "\", \"app_version\": \""
+                    + BuildConfig.VERSION_NAME + "\"}";
             out.write(body.getBytes(StandardCharsets.UTF_8));
         }
 
@@ -2200,6 +2236,10 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
                 // Apply optional device-specific header (text) / footer (images)
                 applyHeaderFooter(json);
 
+                // Screen template change detection: the backend merges
+                // template_stamp into the heartbeat; fetch/apply only when it moves.
+                handleTemplateStamp(json.isNull("template_stamp") ? null : json.optString("template_stamp", null));
+
                 // Check if company expired
                 if (json.optBoolean("company_expired", false)) {
                     Log.d(TAG, "Company subscription expired");
@@ -2225,6 +2265,125 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
 
         c.disconnect();
         return true;
+    }
+
+    // ===== SCREEN TEMPLATE =====
+
+    private static String templateUrl(String id) { return API_BASE + "/device/" + id + "/template"; }
+
+    /**
+     * Called from the heartbeat with the server's template_stamp (or null when the
+     * company has no template linked). Fetches + applies only when it changes.
+     */
+    private void handleTemplateStamp(String stamp) {
+        if (stamp == null) {
+            if (templateActive) ui.post(this::clearTemplate);
+            templateStamp = null;
+            return;
+        }
+        if (stamp.equals(templateStamp) && templateActive) return;
+        fetchAndApplyTemplate(stamp);
+    }
+
+    private void fetchAndApplyTemplate(final String stamp) {
+        if (!templateFetchInProgress.compareAndSet(false, true)) return;
+        new Thread(() -> {
+            try {
+                String id = getAndroidId();
+                HttpURLConnection c = (HttpURLConnection) new URL(templateUrl(id)).openConnection();
+                c.setConnectTimeout(CONNECT_TIMEOUT_MS);
+                c.setReadTimeout(READ_TIMEOUT_MS);
+                c.setRequestMethod("GET");
+                int code = c.getResponseCode();
+                if (code == 404) { c.disconnect(); templateStamp = null; ui.post(this::clearTemplate); return; }
+                if (code / 100 != 2) { c.disconnect(); return; }
+                StringBuilder sb = new StringBuilder();
+                try (BufferedReader br = new BufferedReader(new InputStreamReader(c.getInputStream(), StandardCharsets.UTF_8))) {
+                    String line; while ((line = br.readLine()) != null) sb.append(line);
+                } finally { c.disconnect(); }
+                final JSONObject tpl = new JSONObject(sb.toString());
+                // Cache for offline boot.
+                getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
+                        .putString(PREF_TEMPLATE_JSON, sb.toString()).apply();
+                // Trust the stamp in the response (fallback to the heartbeat's).
+                templateStamp = tpl.isNull("template_stamp") ? stamp : tpl.optString("template_stamp", stamp);
+                ui.post(() -> applyTemplate(tpl));
+            } catch (Exception e) {
+                Log.e(TAG, "template fetch failed: " + e.getMessage());
+            } finally {
+                templateFetchInProgress.set(false);
+            }
+        }).start();
+    }
+
+    /**
+     * Render a template as a transparent overlay on the activity's content root.
+     * The overlay lives ABOVE rootContainer (which the player rebuilds), so it
+     * survives every textureView/player teardown. The playlist plays full-screen
+     * in single mode BEHIND the overlay and shows through the transparent
+     * playlist-zone hole; opaque header/qr/promo zones mask the rest.
+     */
+    private void applyTemplate(JSONObject tpl) {
+        try {
+            templateActive = true;
+            String o = tpl.optString("orientation", "landscape");
+            int want = "portrait".equals(o)
+                    ? ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT
+                    : ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE;
+            if (getRequestedOrientation() != want) setRequestedOrientation(want);
+
+            // Full-screen single-mode playback behind the overlay.
+            if (isGridMode) {
+                switchToSingleMode();
+            } else {
+                try { File d = ensureMainDir(); if (d != null) playMixedPlaylist(d); } catch (Exception ignored) {}
+            }
+
+            ViewGroup contentRoot = findViewById(android.R.id.content);
+            if (templateOverlay != null) {
+                try { contentRoot.removeView(templateOverlay); } catch (Exception ignored) {}
+            }
+            if (templateRenderer == null) templateRenderer = new TemplateRenderer(this, screenWidth, screenHeight);
+            templateOverlay = templateRenderer.build(tpl);
+            contentRoot.addView(templateOverlay, new FrameLayout.LayoutParams(
+                    FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
+            applyImmersive();
+            Log.d(TAG, "Template applied (id=" + tpl.optString("template_id") + ", stamp=" + templateStamp + ")");
+        } catch (Exception e) {
+            Log.e(TAG, "applyTemplate error: " + e.getMessage());
+        }
+    }
+
+    private void clearTemplate() {
+        if (!templateActive && templateOverlay == null) return;
+        templateActive = false;
+        try {
+            ViewGroup contentRoot = findViewById(android.R.id.content);
+            if (templateOverlay != null) { contentRoot.removeView(templateOverlay); templateOverlay = null; }
+        } catch (Exception ignored) {}
+        getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit().remove(PREF_TEMPLATE_JSON).apply();
+        // Resume normal full-screen playback.
+        try {
+            if ("single".equals(layoutMode) || layoutMode == null) {
+                File d = ensureMainDir(); if (d != null) playMixedPlaylist(d);
+            } else {
+                switchToGridMode();
+            }
+        } catch (Exception ignored) {}
+        Log.d(TAG, "Template cleared; resumed normal playback");
+    }
+
+    /** On offline/enrolled boot, render the last cached template (if any). */
+    private void loadCachedTemplateIfAny() {
+        String cached = getSharedPreferences(PREFS_NAME, MODE_PRIVATE).getString(PREF_TEMPLATE_JSON, null);
+        if (cached == null) return;
+        try {
+            final JSONObject tpl = new JSONObject(cached);
+            templateStamp = tpl.optString("template_stamp", null);
+            ui.post(() -> applyTemplate(tpl));
+        } catch (Exception e) {
+            Log.w(TAG, "cached template parse failed: " + e.getMessage());
+        }
     }
 
     /**

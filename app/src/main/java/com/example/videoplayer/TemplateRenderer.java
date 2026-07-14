@@ -231,8 +231,19 @@ public class TemplateRenderer {
             tv.setSelected(true); // needed to start the marquee
             tv.setHorizontallyScrolling(true);
         } else {
-            tv.setMaxLines(3);
+            // Auto-fit: text shrinks to fit the box no matter how long it is.
+            // The designer's font_size_vh becomes the MAX; text scales down (to a
+            // small floor) so nothing overflows or gets clipped.
+            tv.setMaxLines(20);
             tv.setEllipsize(android.text.TextUtils.TruncateAt.END);
+            int maxPx = Math.max(dp(11), Math.round(tv.getTextSize()));
+            int minPx = dp(8);
+            if (minPx < maxPx) {
+                try {
+                    androidx.core.widget.TextViewCompat.setAutoSizeTextTypeUniformWithConfiguration(
+                            tv, minPx, maxPx, Math.max(1, dp(1)), TypedValue.COMPLEX_UNIT_PX);
+                } catch (Exception ignored) { /* keep the fixed size on any OEM quirk */ }
+            }
         }
         return tv;
     }

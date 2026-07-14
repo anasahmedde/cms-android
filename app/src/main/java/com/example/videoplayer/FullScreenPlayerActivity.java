@@ -505,6 +505,13 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
         if (isEnrolled) {
             pollHandler.removeCallbacksAndMessages(null);
             pollHandler.postDelayed(pollRunnable, POLL_MS);
+        } else {
+            // KNOWN-BUG FIX: onPause() cancels the enrollment check but nothing
+            // rescheduled it, so an unenrolled screen stopped noticing it had
+            // been added in the dashboard until the app was killed. Resume it.
+            enrollmentCheckHandler.removeCallbacksAndMessages(null);
+            checkEnrollmentStatus();
+            enrollmentCheckHandler.postDelayed(enrollmentCheckRunnable, ENROLLMENT_CHECK_MS);
         }
         rotationPollHandler.removeCallbacksAndMessages(null);
         rotationPollHandler.postDelayed(rotationPollRunnable, 1000);
@@ -515,6 +522,7 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
     @Override
     protected void onDestroy() {
         super.onDestroy();
+        if (templateRenderer != null) templateRenderer.release(); // zone video decoders
         pollHandler.removeCallbacksAndMessages(null);
         rotationPollHandler.removeCallbacksAndMessages(null);
         tempHandler.removeCallbacksAndMessages(null);
@@ -2343,7 +2351,16 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
             if (templateOverlay != null) {
                 try { contentRoot.removeView(templateOverlay); } catch (Exception ignored) {}
             }
-            if (templateRenderer == null) templateRenderer = new TemplateRenderer(this, screenWidth, screenHeight);
+            if (templateRenderer != null) templateRenderer.release(); // free zone video decoders
+            // Zone math must use the TARGET orientation's dimensions: the cached
+            // onCreate() values are stale when the template just forced a rotation
+            // (portrait phone + landscape template drew every zone swapped).
+            android.util.DisplayMetrics dm = new android.util.DisplayMetrics();
+            getWindowManager().getDefaultDisplay().getRealMetrics(dm);
+            int tw = dm.widthPixels, th = dm.heightPixels;
+            boolean wantPortrait = "portrait".equals(o);
+            if (wantPortrait != (th >= tw)) { int t = tw; tw = th; th = t; }
+            templateRenderer = new TemplateRenderer(this, tw, th);
             templateOverlay = templateRenderer.build(tpl);
             contentRoot.addView(templateOverlay, new FrameLayout.LayoutParams(
                     FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
@@ -2361,6 +2378,7 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
             ViewGroup contentRoot = findViewById(android.R.id.content);
             if (templateOverlay != null) { contentRoot.removeView(templateOverlay); templateOverlay = null; }
         } catch (Exception ignored) {}
+        if (templateRenderer != null) templateRenderer.release(); // free zone video decoders
         getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit().remove(PREF_TEMPLATE_JSON).apply();
         // Resume normal full-screen playback.
         try {

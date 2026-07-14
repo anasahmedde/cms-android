@@ -144,6 +144,12 @@ public class TemplateRenderer {
         JSONObject content = z.optJSONObject("content");
         if (content == null) content = new JSONObject();
 
+        // Multiple positioned text items inside one zone (designer-composed).
+        JSONArray runs = content.optJSONArray("runs");
+        if (("text".equals(type) || "ticker".equals(type)) && runs != null && runs.length() > 0) {
+            return buildTextRuns(style, content, runs, rect);
+        }
+
         switch (type) {
             case "text":   return buildText(z, style, content, rect, false);
             case "ticker": return buildText(z, style, content, rect, true);
@@ -153,6 +159,43 @@ public class TemplateRenderer {
             default:       return null;
         }
     }
+
+    /**
+     * A zone holding multiple positioned, individually-styled text items. Each
+     * run's x/y/w and font size are PERCENTAGES of the zone, so the layout
+     * scales with the screen. The zone's own background still applies underneath.
+     */
+    private View buildTextRuns(JSONObject style, JSONObject content, JSONArray runs, int[] rect) {
+        FrameLayout holder = new FrameLayout(ctx);
+        // Zone-level background (color/gradient/image) behind the runs.
+        applyTextBackground(holder, content, style, rect);
+        int zoneW = rect[2], zoneH = rect[3];
+        for (int i = 0; i < runs.length(); i++) {
+            JSONObject r = runs.optJSONObject(i);
+            if (r == null) continue;
+            TextView tv = new TextView(ctx);
+            tv.setText(r.optString("text", ""));
+            tv.setTextColor(parseColor(r.optString("text_color", "#FFFFFF"), Color.WHITE));
+            double fs = r.optDouble("font_size_vh", 20);
+            float px = Math.max(dp(8), (float) (fs / 100.0 * zoneH));
+            tv.setTextSize(TypedValue.COMPLEX_UNIT_PX, px);
+            if (r.optBoolean("bold", false)) tv.setTypeface(Typeface.DEFAULT_BOLD);
+            String align = r.optString("align", "left");
+            tv.setGravity("center".equals(align) ? Gravity.CENTER_HORIZONTAL
+                    : "right".equals(align) ? Gravity.END : Gravity.START);
+            double rx = clampPct(r.optDouble("x", 0)), ry = clampPct(r.optDouble("y", 0));
+            double rw = r.has("w") ? clampPct(r.optDouble("w", 100)) : (100 - rx);
+            int w = Math.max(1, (int) Math.round(rw / 100.0 * zoneW));
+            FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(
+                    w, FrameLayout.LayoutParams.WRAP_CONTENT);
+            lp.leftMargin = (int) Math.round(rx / 100.0 * zoneW);
+            lp.topMargin = (int) Math.round(ry / 100.0 * zoneH);
+            holder.addView(tv, lp);
+        }
+        return holder;
+    }
+
+    private double clampPct(double v) { return Math.max(0, Math.min(100, v)); }
 
     private TextView baseText(JSONObject content, JSONObject style, int[] rect) {
         TextView tv = new TextView(ctx);
@@ -178,7 +221,7 @@ public class TemplateRenderer {
     }
 
     /** Background precedence: content image > content gradient > content/style color. */
-    private void applyTextBackground(final TextView tv, JSONObject content, JSONObject style, int[] rect) {
+    private void applyTextBackground(final View tv, JSONObject content, JSONObject style, int[] rect) {
         String img = content.optString("bg_image", "");
         if (!img.isEmpty()) {
             final String url = img;

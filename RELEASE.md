@@ -54,7 +54,27 @@ templates and play content, soak for a day, then flip the fleet-wide `version.js
 ⚠️ Publishing `version.json` is the production cutover — it is outward-facing and
 hits real screens. Do it deliberately, never as part of a routine merge.
 
-## What v9.0.0 adds
+## What v10.0.0 adds
+
+- **Video in template media zones**: a `media` zone bound to a video (external
+  URL or presigned S3) now plays inline — a muted, looping ExoPlayer streamed
+  from the URL. Only the FIRST video zone gets a decoder (extra video zones
+  fall back to their background box) so total decoders stay at two (main
+  playlist + one zone), clear of the Qualcomm multi-decoder traps. QR zones
+  stay image-only. Players MUST call `TemplateRenderer.release()` on overlay
+  swap/clear/destroy — wired in the activity.
+- **Solid zone backgrounds render** (was gradient/image only) — pairs with the
+  backend folding `style.bg_color` into resolved content.
+- **Fixes**: enrollment polling now resumes after pause/resume (a screen added
+  in the dashboard while the app was backgrounded no longer stays on the
+  "Not Enrolled" screen until a kill); template zone geometry uses the TARGET
+  orientation's dimensions, so a landscape template on a portrait device no
+  longer draws zones swapped.
+
+Signed v10 checksum: `8f1aff6c708089ccae7507297e8945fe81944f6f4301ecc7f333cd072e7ddae2`
+(signer cert SHA-256 `292bf60f…` — verified identical to the live fleet signer).
+
+## What v9.0.0 added
 
 Screen-template rendering: when a device's company has a linked template, the
 player renders the template zones (text / clock / ticker / image media+qr) as an

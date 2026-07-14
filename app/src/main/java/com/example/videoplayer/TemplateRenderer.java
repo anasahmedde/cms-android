@@ -17,6 +17,13 @@ import android.widget.FrameLayout;
 import android.widget.ImageView;
 import android.widget.TextView;
 
+import androidx.media3.common.MediaItem;
+import androidx.media3.common.PlaybackException;
+import androidx.media3.common.Player;
+import androidx.media3.exoplayer.ExoPlayer;
+import androidx.media3.ui.AspectRatioFrameLayout;
+import androidx.media3.ui.PlayerView;
+
 import org.json.JSONArray;
 import org.json.JSONObject;
 
@@ -26,7 +33,9 @@ import java.io.InputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.text.SimpleDateFormat;
+import java.util.ArrayList;
 import java.util.Date;
+import java.util.List;
 import java.util.Locale;
 
 /**
@@ -39,9 +48,14 @@ import java.util.Locale;
  * battle-tested playback/download/rotation path and keeps decoder pressure to
  * the one player the app already runs (avoids the Qualcomm multi-decoder traps).
  *
- * Zone types handled here: text, ticker, clock, and image media/qr. Video in a
- * media/qr zone is not rendered in this MVP (rare; the reference "whiteboard"
- * uses an image QR + text). The playlist zone is rendered by the activity.
+ * Zone types handled here: text, ticker, clock, image media/qr, and (v10) ONE
+ * video media zone: a muted, looping ExoPlayer streaming straight from the
+ * resolved URL (presigned S3 or external). Only the FIRST video zone gets a
+ * decoder — additional video zones fall back to their background box — keeping
+ * total decoders at two (main playlist + one zone) to stay clear of the
+ * Qualcomm multi-decoder traps. QR zones stay image-only (a QR is a picture).
+ * The playlist zone is rendered by the activity. Callers MUST invoke
+ * release() when swapping or removing the overlay.
  *
  * All geometry is PERCENT (0-100) of the screen, matching the backend contract.
  */
@@ -58,6 +72,7 @@ public class TemplateRenderer {
     private FrameLayout overlay;
     private JSONObject template;
     private int[] playlistRectPx; // {left, top, width, height} or null if no playlist zone
+    private final List<ExoPlayer> zonePlayers = new ArrayList<>();
 
     public TemplateRenderer(Context ctx, int screenW, int screenH) {
         this.ctx = ctx;
@@ -80,6 +95,7 @@ public class TemplateRenderer {
      * added; the caller adds it on top of the video surface.
      */
     public FrameLayout build(JSONObject tpl) {
+        release(); // defensively free any players from a previous overlay
         this.template = tpl;
         this.playlistRectPx = null;
         overlay = new FrameLayout(ctx);
@@ -241,9 +257,19 @@ public class TemplateRenderer {
         FrameLayout holder = new FrameLayout(ctx);
         String bg = style.optString("bg_color", isQr ? "#FFFFFF" : "");
         if (!bg.isEmpty()) holder.setBackgroundColor(parseColor(bg, isQr ? Color.WHITE : Color.TRANSPARENT));
-        if (url.isEmpty() || "video".equals(mediaType)) {
-            // MVP: no video zone rendering; leave the (bg) box. Never an error on screen.
+        if (url.isEmpty()) {
+            return holder; // nothing to show; keep the (bg) box — never an error on screen
+        }
+        if ("video".equals(mediaType) && !isQr) {
+            if (!zonePlayers.isEmpty()) {
+                Log.w(TAG, "Only one video zone is rendered per template; extra video zone skipped");
+                return holder;
+            }
+            attachZoneVideo(holder, url, style);
             return holder;
+        }
+        if ("video".equals(mediaType)) {
+            return holder; // QR zones are image-only
         }
         final ImageView iv = new ImageView(ctx);
         iv.setScaleType(isQr ? ImageView.ScaleType.FIT_CENTER : scaleType(style));
@@ -254,6 +280,45 @@ public class TemplateRenderer {
         holder.addView(iv, lp);
         loadImageAsync(iv, url, Math.max(rect[2], rect[3]));
         return holder;
+    }
+
+    /** Muted, looping video streamed from the resolved URL inside a zone. */
+    private void attachZoneVideo(FrameLayout holder, String url, JSONObject style) {
+        try {
+            PlayerView pv = new PlayerView(ctx);
+            pv.setUseController(false);
+            boolean contain = "contain".equals(style.optString("fit_mode", "cover"));
+            pv.setResizeMode(contain
+                    ? AspectRatioFrameLayout.RESIZE_MODE_FIT
+                    : AspectRatioFrameLayout.RESIZE_MODE_ZOOM);
+            ExoPlayer player = new ExoPlayer.Builder(ctx).build();
+            zonePlayers.add(player);
+            pv.setPlayer(player);
+            player.setMediaItem(MediaItem.fromUri(url));
+            player.setRepeatMode(Player.REPEAT_MODE_ALL);
+            player.setVolume(0f); // the main playlist owns audio
+            player.setPlayWhenReady(true);
+            player.addListener(new Player.Listener() {
+                @Override public void onPlayerError(PlaybackException error) {
+                    // Keep the background box; the template refresh loop retries
+                    // naturally when the stamp moves (e.g. presign renewed).
+                    Log.w(TAG, "zone video error (" + url + "): " + error.getErrorCodeName());
+                }
+            });
+            player.prepare();
+            holder.addView(pv, new FrameLayout.LayoutParams(
+                    FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
+        } catch (Exception e) {
+            Log.w(TAG, "zone video setup failed: " + e.getMessage());
+        }
+    }
+
+    /** Release every zone video player. MUST be called when the overlay is swapped/removed. */
+    public void release() {
+        for (ExoPlayer p : zonePlayers) {
+            try { p.release(); } catch (Exception ignored) { }
+        }
+        zonePlayers.clear();
     }
 
     private ImageView.ScaleType scaleType(JSONObject style) {

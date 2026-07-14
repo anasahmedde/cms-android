@@ -5,6 +5,8 @@ import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.graphics.Color;
 import android.graphics.Typeface;
+import android.graphics.drawable.BitmapDrawable;
+import android.graphics.drawable.GradientDrawable;
 import android.os.Handler;
 import android.os.Looper;
 import android.util.Log;
@@ -129,18 +131,18 @@ public class TemplateRenderer {
         switch (type) {
             case "text":   return buildText(z, style, content, rect, false);
             case "ticker": return buildText(z, style, content, rect, true);
-            case "clock":  return buildClock(style, rect);
+            case "clock":  return buildClock(content, style, rect);
             case "media":
             case "qr":     return buildImage(style, content, rect, "qr".equals(type));
             default:       return null;
         }
     }
 
-    private TextView baseText(JSONObject style, int[] rect) {
+    private TextView baseText(JSONObject content, JSONObject style, int[] rect) {
         TextView tv = new TextView(ctx);
-        String bg = style.optString("bg_color", "");
-        if (!bg.isEmpty()) tv.setBackgroundColor(parseColor(bg, Color.TRANSPARENT));
-        tv.setTextColor(parseColor(style.optString("text_color", "#FFFFFF"), Color.WHITE));
+        applyTextBackground(tv, content, style, rect);
+        String tc = content.optString("text_color", style.optString("text_color", "#FFFFFF"));
+        tv.setTextColor(parseColor(tc, Color.WHITE));
         // font_size_vh is a % of the zone height; convert to px.
         double vh = style.optDouble("font_size_vh", 40);
         float px = (float) (vh / 100.0 * rect[3]);
@@ -159,8 +161,52 @@ public class TemplateRenderer {
         return tv;
     }
 
+    /** Background precedence: content image > content gradient > content/style color. */
+    private void applyTextBackground(final TextView tv, JSONObject content, JSONObject style, int[] rect) {
+        String img = content.optString("bg_image", "");
+        if (!img.isEmpty()) {
+            final String url = img;
+            final int target = Math.max(rect[2], rect[3]);
+            new Thread(() -> {
+                final Bitmap b = downloadAndDecode(url, url.contains("?") ? url.substring(0, url.indexOf('?')) : url, target);
+                if (b != null) ui.post(() -> tv.setBackground(new BitmapDrawable(ctx.getResources(), b)));
+            }).start();
+            return;
+        }
+        JSONObject grad = content.optJSONObject("bg_gradient");
+        if (grad != null) {
+            GradientDrawable gd = buildGradient(grad);
+            if (gd != null) { tv.setBackground(gd); return; }
+        }
+        String col = content.optString("bg_color", style.optString("bg_color", ""));
+        if (!col.isEmpty()) tv.setBackgroundColor(parseColor(col, Color.TRANSPARENT));
+    }
+
+    private GradientDrawable buildGradient(JSONObject grad) {
+        JSONArray stops = grad.optJSONArray("stops");
+        if (stops == null || stops.length() < 2) return null;
+        int[] colors = new int[stops.length()];
+        for (int i = 0; i < stops.length(); i++) colors[i] = parseColor(stops.optString(i, "#000000"), Color.BLACK);
+        GradientDrawable gd = new GradientDrawable();
+        gd.setColors(colors);
+        gd.setOrientation(orientationForAngle(grad.optInt("angle", 135)));
+        return gd;
+    }
+
+    private GradientDrawable.Orientation orientationForAngle(int a) {
+        a = ((a % 360) + 360) % 360;  // CSS angle → the nearest of 8 drawable directions
+        if (a < 23 || a >= 338) return GradientDrawable.Orientation.LEFT_RIGHT;
+        if (a < 68) return GradientDrawable.Orientation.BL_TR;
+        if (a < 113) return GradientDrawable.Orientation.BOTTOM_TOP;
+        if (a < 158) return GradientDrawable.Orientation.BR_TL;
+        if (a < 203) return GradientDrawable.Orientation.RIGHT_LEFT;
+        if (a < 248) return GradientDrawable.Orientation.TR_BL;
+        if (a < 293) return GradientDrawable.Orientation.TOP_BOTTOM;
+        return GradientDrawable.Orientation.TL_BR;
+    }
+
     private View buildText(JSONObject z, JSONObject style, JSONObject content, int[] rect, boolean ticker) {
-        TextView tv = baseText(style, rect);
+        TextView tv = baseText(content, style, rect);
         tv.setText(content.optString("text", ""));
         if (ticker) {
             tv.setSingleLine(true);
@@ -175,8 +221,8 @@ public class TemplateRenderer {
         return tv;
     }
 
-    private View buildClock(JSONObject style, int[] rect) {
-        final TextView tv = baseText(style, rect);
+    private View buildClock(JSONObject content, JSONObject style, int[] rect) {
+        final TextView tv = baseText(content, style, rect);
         final String fmt = "HH:mm:ss".equals(style.optString("format", "HH:mm")) ? "HH:mm:ss" : "HH:mm";
         final SimpleDateFormat sdf = new SimpleDateFormat(fmt, Locale.getDefault());
         final Runnable tick = new Runnable() {

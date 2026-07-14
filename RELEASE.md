@@ -54,6 +54,20 @@ templates and play content, soak for a day, then flip the fleet-wide `version.js
 ⚠️ Publishing `version.json` is the production cutover — it is outward-facing and
 hits real screens. Do it deliberately, never as part of a routine merge.
 
+## What v10.0.1 adds
+
+- **Text zones auto-fit**: any text, however long, shrinks to fit its box (the
+  designer's font size is the max; text scales down to a floor). No overflow,
+  no clipping.
+- **Fix — spurious "No media files found" toast**: a template built entirely
+  from fixed zones (no playlist/rotation zone) no longer tries to play the
+  empty main rotation, so it stops popping that toast over a perfectly-good
+  template. The empty-rotation toasts are also suppressed while a template is
+  active.
+
+Signed v10.0.1 checksum: `d2a2ec8ea2403b06f7446b589c52b28a0c446dfed0ce64f1e00b7cb4dec2c4b1`
+(signer cert SHA-256 `292bf60f…` — identical to the live fleet signer).
+
 ## What v10.0.0 adds
 
 - **Video in template media zones**: a `media` zone bound to a video (external

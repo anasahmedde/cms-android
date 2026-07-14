@@ -2331,6 +2331,17 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
      * in single mode BEHIND the overlay and shows through the transparent
      * playlist-zone hole; opaque header/qr/promo zones mask the rest.
      */
+    /** True if the template defines a playlist (rotation) zone. */
+    private boolean templateHasPlaylistZone(JSONObject tpl) {
+        JSONArray zones = tpl == null ? null : tpl.optJSONArray("zones");
+        if (zones == null) return false;
+        for (int i = 0; i < zones.length(); i++) {
+            JSONObject z = zones.optJSONObject(i);
+            if (z != null && "playlist".equals(z.optString("type", ""))) return true;
+        }
+        return false;
+    }
+
     private void applyTemplate(JSONObject tpl) {
         try {
             templateActive = true;
@@ -2340,11 +2351,23 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
                     : ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE;
             if (getRequestedOrientation() != want) setRequestedOrientation(want);
 
-            // Full-screen single-mode playback behind the overlay.
-            if (isGridMode) {
-                switchToSingleMode();
+            // Full-screen single-mode playback behind the overlay — ONLY when the
+            // template actually has a playlist zone. A template built entirely from
+            // fixed zones (text/qr/image/video) has no rotation, so starting the
+            // main playlist here was pointless and, on a device with no assigned
+            // rotation, popped a spurious "No media files found" toast over a
+            // perfectly-good template.
+            boolean hasPlaylistZone = templateHasPlaylistZone(tpl);
+            if (hasPlaylistZone) {
+                if (isGridMode) {
+                    switchToSingleMode();
+                } else {
+                    try { File d = ensureMainDir(); if (d != null) playMixedPlaylist(d); } catch (Exception ignored) {}
+                }
             } else {
-                try { File d = ensureMainDir(); if (d != null) playMixedPlaylist(d); } catch (Exception ignored) {}
+                // No rotation in this template — stop any leftover playback so it
+                // doesn't bleed through gaps behind the fixed zones.
+                try { if (player != null) player.stop(); } catch (Exception ignored) {}
             }
 
             ViewGroup contentRoot = findViewById(android.R.id.content);
@@ -2798,7 +2821,7 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
 
     private void playLocalPlaylistOrToast(File dir, int thisGeneration) {
         List<File> allFiles = listMp4(dir);
-        if (allFiles.isEmpty()) { ui.post(() -> toast("No videos found")); return; }
+        if (allFiles.isEmpty()) { if (!templateActive) ui.post(() -> toast("No videos found")); return; }
 
         // Filter to only assigned videos (files with server metadata)
         List<File> files = new ArrayList<>();
@@ -3171,7 +3194,7 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
 
         List<File> allMedia = listAllMedia(dir);
         if (allMedia.isEmpty()) {
-            toast("No media files found");
+            if (!templateActive) toast("No media files found");
             return;
         }
 
@@ -3238,7 +3261,7 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
             Log.d(TAG, "Playing mixed content");
             playMixedContent(videos, images, thisGeneration);
         } else {
-            toast("No media files found");
+            if (!templateActive) toast("No media files found");
         }
     }
 
@@ -4198,7 +4221,7 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
         // Get all media files (videos and images)
         List<File> allMedia = listAllMedia(dir);
         if (allMedia.isEmpty()) {
-            toast("No content found for grid");
+            if (!templateActive) toast("No content found for grid");
             return;
         }
 

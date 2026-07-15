@@ -942,9 +942,10 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
                 FrameLayout.LayoutParams.WRAP_CONTENT);
         p.gravity = android.view.Gravity.CENTER;
         downloadStatusOverlay.setLayoutParams(p);
-        downloadStatusOverlay.setText("Content updating...");
+        downloadStatusOverlay.setText("Updating content…");
         downloadStatusOverlay.setTextColor(0xFFFFFFFF);
         downloadStatusOverlay.setTextSize(18f);
+        downloadStatusOverlay.setGravity(android.view.Gravity.CENTER);
         downloadStatusOverlay.setBackgroundColor(0xCC000000);
         int pad = (int) (16 * getResources().getDisplayMetrics().density);
         downloadStatusOverlay.setPadding(pad * 2, pad, pad * 2, pad);
@@ -953,17 +954,37 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
     }
 
     private void setDownloadingOverlay(boolean show) {
-        if (android.os.Looper.myLooper() == android.os.Looper.getMainLooper()) {
-            if (downloadStatusOverlay != null) {
-                downloadStatusOverlay.setVisibility(show ? View.VISIBLE : View.GONE);
-            }
-        } else {
-            ui.post(() -> {
-                if (downloadStatusOverlay != null) {
-                    downloadStatusOverlay.setVisibility(show ? View.VISIBLE : View.GONE);
-                }
-            });
+        // Reset to the generic label whenever we (re)show or hide, so a stale
+        // percentage from a previous run never lingers on screen.
+        applyDownloadOverlay(show, show ? "Updating content…" : null);
+    }
+
+    /**
+     * Update the overlay with live download progress, then auto-hide it when the
+     * batch completes — the way common apps show a transient updating indicator.
+     * percent < 0 means "size unknown" (indeterminate); render a spinner-ish label.
+     */
+    private void updateDownloadProgress(int fileIndex, int fileCount, int percent, long doneBytes) {
+        StringBuilder sb = new StringBuilder("Updating content…");
+        if (percent >= 0) {
+            sb.append("  ").append(Math.min(100, Math.max(0, percent))).append('%');
+        } else if (doneBytes > 0) {
+            sb.append("  ").append(doneBytes / 1024 / 1024).append(" MB");
         }
+        if (fileCount > 1) {
+            sb.append("\nItem ").append(Math.min(fileIndex + 1, fileCount)).append(" of ").append(fileCount);
+        }
+        applyDownloadOverlay(true, sb.toString());
+    }
+
+    private void applyDownloadOverlay(boolean show, String text) {
+        Runnable r = () -> {
+            if (downloadStatusOverlay == null) return;
+            if (text != null) downloadStatusOverlay.setText(text);
+            downloadStatusOverlay.setVisibility(show ? View.VISIBLE : View.GONE);
+        };
+        if (android.os.Looper.myLooper() == android.os.Looper.getMainLooper()) r.run();
+        else ui.post(r);
     }
 
     /** Apply mute/unmute to every active ExoPlayer and persist the state locally. */
@@ -1839,6 +1860,45 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
     }
 
     /**
+     * Delete cached media files that are NOT in the current server-assigned set.
+     * This frees storage when the device fills up and, just as importantly, stops
+     * stale/unassigned files from ever being picked up by the offline fallback
+     * playlist. Safety guards:
+     *   - Does nothing unless the assigned set is non-empty (a failed/empty server
+     *     fetch must never wipe the cache).
+     *   - Never deletes a file that is in the currently-playing playlist.
+     * Returns the number of bytes freed.
+     *
+     * Note: the assigned set comes from the paged downloads list (server cap 200);
+     * a device with more than 200 assigned items is not expected for signage.
+     */
+    private long pruneUnassignedContent(File mainDir, List<String> assignedFilenames) {
+        if (mainDir == null || assignedFilenames == null || assignedFilenames.isEmpty()) return 0;
+        Set<String> keep = new HashSet<>();
+        for (String n : assignedFilenames) if (n != null) keep.add(n.toLowerCase());
+        Set<String> playing = new HashSet<>();
+        for (File f : currentPlaylistFiles) if (f != null) playing.add(f.getName().toLowerCase());
+
+        File[] files = mainDir.listFiles((d, n) -> {
+            String lower = n.toLowerCase();
+            return lower.endsWith(".mp4") || lower.endsWith(".jpg") || lower.endsWith(".jpeg") ||
+                    lower.endsWith(".png") || lower.endsWith(".gif") || lower.endsWith(".webp");
+        });
+        if (files == null) return 0;
+
+        long freed = 0; int removed = 0;
+        for (File f : files) {
+            String name = f.getName().toLowerCase();
+            if (keep.contains(name) || playing.contains(name)) continue;
+            long sz = f.length();
+            if (f.delete()) { freed += sz; removed++; Log.d(TAG, "Pruned unassigned content: " + f.getName()); }
+            else Log.w(TAG, "Failed to prune unassigned file: " + f.getName());
+        }
+        if (removed > 0) Log.d(TAG, "Pruned " + removed + " unassigned file(s), freed " + (freed / 1024 / 1024) + "MB");
+        return freed;
+    }
+
+    /**
      * Calculate total size of downloaded content files.
      */
     private long calculateContentSize(File directory) {
@@ -2017,8 +2077,12 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
             }
         }
 
-        // NOTE: We do NOT delete unassigned content anymore!
-        // Content stays on device for future reuse
+        // Free storage and stop stale playback: delete any cached media that is
+        // no longer in the server-assigned set. Guarded inside so an empty/failed
+        // server list never wipes the cache, and the currently-playing file is
+        // never deleted. This keeps the device to exactly its assigned content
+        // (fixes "plays a random old local video") and reclaims space when full.
+        pruneUnassignedContent(mainDir, expectedFilenames);
 
         // Download only NEW content
         if (!urlsToDownload.isEmpty()) {
@@ -2044,9 +2108,10 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
             int downloaded = 0;
             int failed = 0;
 
-            for (String urlStr : urlsToDownload) {
+            for (int di = 0; di < urlsToDownload.size(); di++) {
+                String urlStr = urlsToDownload.get(di);
                 try {
-                    File f = bigFileDownloadWithResume(urlStr, mainDir);
+                    File f = bigFileDownloadWithResume(urlStr, mainDir, di, urlsToDownload.size());
                     if (f != null && f.exists() && f.length() > 0) {
                         downloaded++;
                         Log.d(TAG, "Downloaded: " + f.getName() + " (" + f.length() + " bytes)");
@@ -2667,9 +2732,10 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
         if (urls == null || urls.isEmpty()) return 0;
         ui.post(() -> toast("Downloading " + urls.size() + " video(s)…"));
         int ok = 0;
-        for (String url : urls) {
+        for (int di = 0; di < urls.size(); di++) {
+            String url = urls.get(di);
             try {
-                File f = bigFileDownloadWithResume(url, dir);
+                File f = bigFileDownloadWithResume(url, dir, di, urls.size());
                 if (f != null && f.exists() && f.length() > 0) ok++;
             } catch (Exception e) { Log.e(TAG, "DL fail: " + e.getMessage()); }
         }
@@ -2677,6 +2743,10 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
     }
 
     private File bigFileDownloadWithResume(String urlStr, File dir) throws Exception {
+        return bigFileDownloadWithResume(urlStr, dir, 0, 1);
+    }
+
+    private File bigFileDownloadWithResume(String urlStr, File dir, int fileIndex, int fileCount) throws Exception {
         String name = filenameFromUrl(urlStr);
         File part = new File(dir, name + ".part");
         long have = part.exists() ? part.length() : 0;
@@ -2727,17 +2797,29 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
                         int n;
                         long downloaded = have;
                         long lastProgressLog = System.currentTimeMillis();
+                        long lastUiUpdate = 0;
+                        int lastUiPercent = -1;
 
                         while ((n = in.read(buf)) != -1) {
                             fos.write(buf, 0, n);
                             downloaded += n;
 
-                            // Log progress every 5 seconds
                             long now = System.currentTimeMillis();
+
+                            // Live on-screen progress: update when the whole-number
+                            // percent changes, throttled to ~300ms so we never spam
+                            // the UI thread on fast connections.
+                            int percent = totalSize > 0 ? (int) ((downloaded * 100) / totalSize) : -1;
+                            if (percent != lastUiPercent && now - lastUiUpdate > 300) {
+                                lastUiPercent = percent;
+                                lastUiUpdate = now;
+                                updateDownloadProgress(fileIndex, fileCount, percent, downloaded);
+                            }
+
+                            // Log progress every 5 seconds
                             if (now - lastProgressLog > 5000) {
                                 lastProgressLog = now;
                                 if (totalSize > 0) {
-                                    int percent = (int) ((downloaded * 100) / totalSize);
                                     Log.d(TAG, "Downloading " + name + ": " + percent + "% (" +
                                             (downloaded / 1024 / 1024) + "MB / " + (totalSize / 1024 / 1024) + "MB)");
                                 } else {

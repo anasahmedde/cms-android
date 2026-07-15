@@ -48,12 +48,14 @@ import java.util.Locale;
  * battle-tested playback/download/rotation path and keeps decoder pressure to
  * the one player the app already runs (avoids the Qualcomm multi-decoder traps).
  *
- * Zone types handled here: text, ticker, clock, image media/qr, and (v10) ONE
- * video media zone: a muted, looping ExoPlayer streaming straight from the
- * resolved URL (presigned S3 or external). Only the FIRST video zone gets a
- * decoder — additional video zones fall back to their background box — keeping
- * total decoders at two (main playlist + one zone) to stay clear of the
- * Qualcomm multi-decoder traps. QR zones stay image-only (a QR is a picture).
+ * Zone types handled here: text, ticker, clock, image media/qr, and video
+ * media zones: each a muted, looping ExoPlayer streaming straight from the
+ * resolved URL (presigned S3 or external). Every video zone gets its own
+ * decoder up to MAX_ZONE_VIDEO_PLAYERS; beyond that budget a zone falls back
+ * to an opaque box (so the main playlist video behind the transparent overlay
+ * doesn't bleed through and look like the wrong video). The cap keeps the
+ * concurrent decoder count bounded to stay clear of the Qualcomm multi-decoder
+ * traps. QR zones stay image-only (a QR is a picture).
  * The playlist zone is rendered by the activity. Callers MUST invoke
  * release() when swapping or removing the overlay.
  *
@@ -64,6 +66,12 @@ public class TemplateRenderer {
     private static final String TAG = "TemplateRenderer";
     private static final int CONNECT_TIMEOUT_MS = 8_000;
     private static final int READ_TIMEOUT_MS = 15_000;
+    // Max simultaneous in-zone video decoders. Each zone video is one hardware
+    // decoder; together with the main playlist player that is up to MAX+1
+    // concurrent decoders. Kept small so a pathological template can't exhaust
+    // the decoder pool on low-end (e.g. Qualcomm) signage boxes. Video zones
+    // past the cap render as an opaque box, not a transparent hole.
+    private static final int MAX_ZONE_VIDEO_PLAYERS = 3;
 
     private final Context ctx;
     private final Handler ui = new Handler(Looper.getMainLooper());
@@ -315,8 +323,13 @@ public class TemplateRenderer {
             return holder; // nothing to show; keep the (bg) box — never an error on screen
         }
         if ("video".equals(mediaType) && !isQr) {
-            if (!zonePlayers.isEmpty()) {
-                Log.w(TAG, "Only one video zone is rendered per template; extra video zone skipped");
+            if (zonePlayers.size() >= MAX_ZONE_VIDEO_PLAYERS) {
+                // Over the decoder budget: paint an opaque box so the main
+                // playlist video behind the transparent overlay doesn't bleed
+                // through this zone and read as the wrong video.
+                if (bg.isEmpty()) holder.setBackgroundColor(Color.BLACK);
+                Log.w(TAG, "zone video decoder budget reached (" + MAX_ZONE_VIDEO_PLAYERS
+                        + "); extra video zone shown as a static box");
                 return holder;
             }
             attachZoneVideo(holder, url, style);

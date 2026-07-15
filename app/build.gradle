@@ -20,8 +20,8 @@ android {
         applicationId "com.example.videoplayer"
         minSdk 21
         targetSdk 36
-        versionCode 13
-        versionName "10.1.1"
+        versionCode 14
+        versionName "10.1.2"
 
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
     }

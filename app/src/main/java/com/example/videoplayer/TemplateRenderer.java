@@ -218,7 +218,9 @@ public class TemplateRenderer {
         tv.setTextSize(TypedValue.COMPLEX_UNIT_PX, px);
         String align = style.optString("align", "center");
         int g = "left".equals(align) ? Gravity.START : "right".equals(align) ? Gravity.END : Gravity.CENTER_HORIZONTAL;
-        tv.setGravity(g | Gravity.CENTER_VERTICAL);
+        String valign = style.optString("valign", "middle");
+        int vg = "top".equals(valign) ? Gravity.TOP : "bottom".equals(valign) ? Gravity.BOTTOM : Gravity.CENTER_VERTICAL;
+        tv.setGravity(g | vg);
         if (style.optBoolean("bold", false)) tv.setTypeface(Typeface.DEFAULT_BOLD);
         // RTL for Urdu/Arabic
         if ("rtl".equals(style.optString("direction", "ltr"))) {

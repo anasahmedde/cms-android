@@ -110,11 +110,11 @@ public class ReedSyncWorker extends Worker {
         }
     }
 
-    @SuppressLint("HardwareIds")
+    // Stable device id, shared with the player activity (persisted, survives
+    // reinstall/re-sign; seeded from ANDROID_ID on first run). See DeviceIdentity.
     private String getDeviceId(Context ctx) {
         try {
-            return Settings.Secure.getString(
-                    ctx.getContentResolver(), Settings.Secure.ANDROID_ID);
+            return DeviceIdentity.get(ctx);
         } catch (Exception e) {
             return null;
         }

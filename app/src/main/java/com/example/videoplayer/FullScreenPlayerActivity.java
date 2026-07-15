@@ -3614,8 +3614,10 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
         }
     }
 
-    @SuppressLint("HardwareIds")
-    private String getAndroidId() { return Settings.Secure.getString(getContentResolver(), Settings.Secure.ANDROID_ID); }
+    // Stable device id (persisted, survives reinstall/re-sign) — see DeviceIdentity.
+    // Kept the method name so all existing call sites use the stable id unchanged;
+    // it is seeded from ANDROID_ID on first run so enrolled devices keep their id.
+    private String getAndroidId() { return DeviceIdentity.get(this); }
 
     private File ensureMainDir() { File d = new File(Environment.getExternalStorageDirectory(), ROOT_DIR); if (!d.exists()) d.mkdirs(); return d; }
     private File ensureTempDir() { File d = new File(Environment.getExternalStorageDirectory(), TEMP_DIR); if (!d.exists()) d.mkdirs(); return d; }

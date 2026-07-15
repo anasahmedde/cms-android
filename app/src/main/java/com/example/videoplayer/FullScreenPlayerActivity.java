@@ -784,12 +784,22 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
                 Log.d(TAG, "Device was deactivated - stopping playback immediately");
                 stopAllPlayback();
             }
+            // stopAllPlayback() doesn't touch the template overlay or its zone
+            // video players — tear them down too, or the (opaque) template keeps
+            // rendering ABOVE the enrollment screen and looks like the delete was
+            // never detected.
+            removeTemplateOverlay();
             // Stop poll handler so it doesn't restart playback
             pollHandler.removeCallbacksAndMessages(null);
             showEnrollmentOverlay(true);
             if (retryText != null) {
                 retryText.setText("Device not enrolled. Checking again in 15 seconds...");
             }
+            // Re-arm the enrollment watchdog: onPause() cancels it and onResume()
+            // only restarts it when NOT enrolled — so at this point it may be dead,
+            // and without it a re-added device would never be noticed.
+            enrollmentCheckHandler.removeCallbacksAndMessages(null);
+            enrollmentCheckHandler.postDelayed(enrollmentCheckRunnable, ENROLLMENT_CHECK_MS);
         });
     }
 
@@ -2227,17 +2237,12 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
             try {
                 boolean stillActive = postOnlineAndCheckStatus(updateOnlineUrl(getAndroidId()));
                 if (!stillActive) {
-                    // Device has been deactivated or company expired - show enrollment screen
+                    // Device deleted/deactivated or company expired — full teardown
+                    // (playback + template overlay + re-armed enrollment watchdog)
+                    // via the shared path, then the heartbeat-specific message.
                     Log.d(TAG, "Heartbeat returned inactive - showing enrollment screen");
-                    isEnrolled = false;
-                    // Clear the enrolled flag so it doesn't play cached content
-                    getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
-                            .putBoolean(PREF_WAS_ENROLLED, false)
-                            .apply();
+                    handleDeviceDeactivated();
                     ui.post(() -> {
-                        stopAllPlayback();
-                        pollHandler.removeCallbacksAndMessages(null);
-                        showEnrollmentOverlay(true);
                         if (retryText != null) {
                             retryText.setText("Device deactivated or subscription expired. Waiting for reactivation...");
                         }
@@ -2292,48 +2297,54 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
                 // Parse JSON response
                 JSONObject json = new JSONObject(response);
 
-                // Check for wipe_videos command from server
-                if (json.optBoolean("wipe_videos", false)) {
-                    Log.d(TAG, "Server requested video wipe - deleting all local content");
-                    ui.post(() -> wipeAllLocalVideos());
-                }
-
-                // Apply mute/unmute from dashboard setting
-                applyMuteToAllPlayers(json.optBoolean("is_muted", false));
-
-                // Cache BLE device ID set by admin in web dashboard
-                String bleId = json.isNull("ble_device_id") ? "" : json.optString("ble_device_id", "");
-                getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
-                        .putString(PREF_BLE_DEVICE_ID, bleId).apply();
-
-                // Apply optional device-specific header (text) / footer (images)
-                applyHeaderFooter(json);
-
-                // Screen template change detection: the backend merges
-                // template_stamp into the heartbeat; fetch/apply only when it moves.
-                handleTemplateStamp(json.isNull("template_stamp") ? null : json.optString("template_stamp", null));
-
-                // Check if company expired
+                // Deactivation verdict FIRST: the caller swallows exceptions, so a
+                // failure in any cosmetic side-effect below must never mask an
+                // inactive/expired signal (device would keep playing forever).
                 if (json.optBoolean("company_expired", false)) {
                     Log.d(TAG, "Company subscription expired");
                     c.disconnect();
                     return false;
                 }
-
-                // Check if device is still active
                 if (!json.optBoolean("is_active", true)) {
                     Log.d(TAG, "Device is not active");
                     c.disconnect();
                     return false;
                 }
-
-                // Check force_refresh flag - if true, device should stop and refresh
                 if (json.optBoolean("force_refresh", false)) {
                     Log.d(TAG, "Force refresh flag is set");
                     c.disconnect();
                     return false;
                 }
+
+                try {
+                    // Check for wipe_videos command from server
+                    if (json.optBoolean("wipe_videos", false)) {
+                        Log.d(TAG, "Server requested video wipe - deleting all local content");
+                        ui.post(() -> wipeAllLocalVideos());
+                    }
+
+                    // Apply mute/unmute from dashboard setting
+                    applyMuteToAllPlayers(json.optBoolean("is_muted", false));
+
+                    // Cache BLE device ID set by admin in web dashboard
+                    String bleId = json.isNull("ble_device_id") ? "" : json.optString("ble_device_id", "");
+                    getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
+                            .putString(PREF_BLE_DEVICE_ID, bleId).apply();
+
+                    // Apply optional device-specific header (text) / footer (images)
+                    applyHeaderFooter(json);
+
+                    // Screen template change detection: the backend merges
+                    // template_stamp into the heartbeat; fetch/apply only when it moves.
+                    handleTemplateStamp(json.isNull("template_stamp") ? null : json.optString("template_stamp", null));
+                } catch (Exception e) {
+                    Log.w(TAG, "Heartbeat side-effect failed (device stays active): " + e.getMessage());
+                }
             }
+        } else {
+            // Transient server trouble (5xx/ALB errors) — stay active, but say so:
+            // silent fall-through made delayed delete-detection undiagnosable.
+            Log.w(TAG, "Heartbeat unexpected HTTP " + responseCode + " — treating as still active");
         }
 
         c.disconnect();
@@ -2430,9 +2441,16 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
                     try { File d = ensureMainDir(); if (d != null) playMixedPlaylist(d); } catch (Exception ignored) {}
                 }
             } else {
-                // No rotation in this template — stop any leftover playback so it
-                // doesn't bleed through gaps behind the fixed zones.
-                try { if (player != null) player.stop(); } catch (Exception ignored) {}
+                // No playlist zone in this template — NOTHING may keep playing
+                // behind the overlay (grid players/slideshow would be invisible
+                // but audible; leftovers also bleed through gaps between zones).
+                try {
+                    imageTimerHandler.removeCallbacksAndMessages(null);
+                    stopImageSlideshow();
+                    if (player != null) { player.stop(); player.clearMediaItems(); }
+                    releaseGridResources();
+                    isGridMode = false;
+                } catch (Exception ignored) {}
             }
 
             ViewGroup contentRoot = findViewById(android.R.id.content);
@@ -2459,8 +2477,15 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
         }
     }
 
-    private void clearTemplate() {
-        if (!templateActive && templateOverlay == null) return;
+    /**
+     * Tear down the template overlay + its zone video players WITHOUT resuming
+     * playback. Shared by clearTemplate() (which then resumes) and
+     * handleDeviceDeactivated() (which must NOT resume). The overlay sits above
+     * the whole window (android.R.id.content), so leaving it up would cover the
+     * enrollment screen — a deleted device kept rendering its template forever.
+     * Must run on the UI thread.
+     */
+    private void removeTemplateOverlay() {
         templateActive = false;
         try {
             ViewGroup contentRoot = findViewById(android.R.id.content);
@@ -2468,6 +2493,11 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
         } catch (Exception ignored) {}
         if (templateRenderer != null) templateRenderer.release(); // free zone video decoders
         getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit().remove(PREF_TEMPLATE_JSON).apply();
+    }
+
+    private void clearTemplate() {
+        if (!templateActive && templateOverlay == null) return;
+        removeTemplateOverlay();
         // Resume normal full-screen playback.
         try {
             if ("single".equals(layoutMode) || layoutMode == null) {
@@ -3274,6 +3304,23 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
         }
         isGridMode = false;
 
+        // Deactivated/deleted device: a queued lambda from an in-flight sync
+        // worker must not restart playback after the enrollment screen was shown.
+        if (!isEnrolled) {
+            Log.d(TAG, "playMixedPlaylist skipped: not enrolled");
+            return;
+        }
+
+        // Template WITHOUT a playlist zone: nothing may play behind the overlay.
+        // The playlist would be invisible behind the opaque zones but AUDIBLE
+        // (the "another video playing in the background" bug). Existing playback
+        // was already stopped above; just don't start anything new. Guarding here
+        // covers every caller (post-sync, polls, layout fetches, ...).
+        if (templateActive && (templateRenderer == null || templateRenderer.playlistRectPx() == null)) {
+            Log.d(TAG, "playMixedPlaylist skipped: template active with no playlist zone");
+            return;
+        }
+
         List<File> allMedia = listAllMedia(dir);
         if (allMedia.isEmpty()) {
             if (!templateActive) toast("No media files found");
@@ -3891,6 +3938,12 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
     // ===== GRID MODE METHODS =====
 
     private void switchToSingleMode() {
+        // Deactivated device: don't rebuild views / restart playback under the
+        // enrollment screen (in-flight sync lambdas can land here late).
+        if (!isEnrolled) {
+            Log.d(TAG, "switchToSingleMode skipped: not enrolled");
+            return;
+        }
         Log.d(TAG, "Switching to SINGLE mode");
         isGridMode = false;
 
@@ -4029,9 +4082,11 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
             );
             rootContainer.addView(textureView, params);
 
-            // Re-add enrollment overlay on top (hidden)
+            // Re-add enrollment overlay on top — PRESERVING its state: forcing it
+            // GONE here un-showed the enrollment screen when a pending mode-switch
+            // lambda ran just after a deactivation.
             if (enrollmentOverlay != null && enrollmentOverlay.getParent() == null) {
-                enrollmentOverlay.setVisibility(View.GONE);
+                enrollmentOverlay.setVisibility(isEnrolled ? View.GONE : View.VISIBLE);
                 rootContainer.addView(enrollmentOverlay);
             }
 
@@ -4046,6 +4101,14 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
     }
 
     private void switchToGridMode() {
+        // Template mode is single-mode only ("never switch to full-screen grid,
+        // which would fight the overlay"). Guarding here covers EVERY caller —
+        // grid players behind the opaque template are invisible but audible.
+        // Same for a deactivated device: queued sync lambdas must not restart.
+        if (templateActive || !isEnrolled) {
+            Log.d(TAG, "switchToGridMode skipped: " + (templateActive ? "template active" : "not enrolled"));
+            return;
+        }
         // Debounce: if a switch is already in progress (resources releasing, delay pending),
         // skip this call. Qualcomm c2 decoders need ~300ms to free output buffer slots after
         // player.release() — stacking calls exhausts the SurfaceTexture buffer queue (NO_MEMORY).
@@ -4197,9 +4260,11 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
                 }
             }, 500);
 
-            // Re-add enrollment overlay on top (hidden) so it's not lost
+            // Re-add enrollment overlay on top so it's not lost — PRESERVING its
+            // state: forcing it GONE here un-showed the enrollment screen when a
+            // pending mode-switch lambda ran just after a deactivation.
             if (enrollmentOverlay != null && enrollmentOverlay.getParent() == null) {
-                enrollmentOverlay.setVisibility(View.GONE);
+                enrollmentOverlay.setVisibility(isEnrolled ? View.GONE : View.VISIBLE);
                 rootContainer.addView(enrollmentOverlay);
             }
 
@@ -4302,6 +4367,12 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
     }
 
     private void playGridVideos(File dir, int numSlots) {
+        // Deactivated device: surface-ready callbacks and the 500ms fallback can
+        // land after the enrollment screen was shown — don't restart playback.
+        if (!isEnrolled) {
+            Log.d(TAG, "playGridVideos skipped: not enrolled");
+            return;
+        }
         // Get all media files (videos and images)
         List<File> allMedia = listAllMedia(dir);
         if (allMedia.isEmpty()) {

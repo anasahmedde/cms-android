@@ -2371,7 +2371,13 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
 
     private void fetchAndApplyTemplate(final String stamp) {
         if (!templateFetchInProgress.compareAndSet(false, true)) return;
+        // Show a brief on-screen "Updating content…" hint when a LIVE template's
+        // content changes (dashboard edit), so an operator sees the box refresh
+        // instead of it happening silently. Not shown on first/offline load.
+        final boolean liveUpdate = templateActive;
+        if (liveUpdate) ui.post(() -> applyDownloadOverlay(true, "Updating content…"));
         new Thread(() -> {
+            boolean applied = false;
             try {
                 String id = getAndroidId();
                 HttpURLConnection c = (HttpURLConnection) new URL(templateUrl(id)).openConnection();
@@ -2392,10 +2398,22 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
                 // Trust the stamp in the response (fallback to the heartbeat's).
                 templateStamp = tpl.isNull("template_stamp") ? stamp : tpl.optString("template_stamp", stamp);
                 ui.post(() -> applyTemplate(tpl));
+                applied = true;
             } catch (Exception e) {
                 Log.e(TAG, "template fetch failed: " + e.getMessage());
             } finally {
                 templateFetchInProgress.set(false);
+                // Hide the hint just after the rebuild (kept briefly so it's visible),
+                // or immediately if the fetch failed. applyTemplate re-adds the same
+                // overlay view on top, preserving this state until we hide it.
+                if (liveUpdate) {
+                    final long delay = applied ? 1000L : 0L;
+                    ui.post(() -> {
+                        if (downloadStatusOverlay != null)
+                            downloadStatusOverlay.postDelayed(() -> applyDownloadOverlay(false, null), delay);
+                        else applyDownloadOverlay(false, null);
+                    });
+                }
             }
         }).start();
     }

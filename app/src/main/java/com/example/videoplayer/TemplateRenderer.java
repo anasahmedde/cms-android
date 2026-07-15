@@ -360,7 +360,7 @@ public class TemplateRenderer {
             pv.setResizeMode(contain
                     ? AspectRatioFrameLayout.RESIZE_MODE_FIT
                     : AspectRatioFrameLayout.RESIZE_MODE_ZOOM);
-            ExoPlayer player = new ExoPlayer.Builder(ctx).build();
+            final ExoPlayer player = new ExoPlayer.Builder(ctx).build();
             zonePlayers.add(player);
             pv.setPlayer(player);
             player.setMediaItem(MediaItem.fromUri(url));
@@ -368,10 +368,18 @@ public class TemplateRenderer {
             player.setVolume(0f); // the main playlist owns audio
             player.setPlayWhenReady(true);
             player.addListener(new Player.Listener() {
+                private int errs = 0;
                 @Override public void onPlayerError(PlaybackException error) {
-                    // Keep the background box; the template refresh loop retries
-                    // naturally when the stamp moves (e.g. presign renewed).
                     Log.w(TAG, "zone video error (" + url + "): " + error.getErrorCodeName());
+                    // Bounded re-prepare handles a transient network stall so the box
+                    // doesn't stay black. A hard failure (e.g. the presigned URL has
+                    // expired — a 403) can't recover from the same URL: the activity's
+                    // periodic template re-fetch renews the URL and rebuilds the zone.
+                    if (++errs <= 3) {
+                        new Handler(Looper.getMainLooper()).postDelayed(() -> {
+                            try { player.prepare(); player.play(); } catch (Exception ignored) { }
+                        }, 3000L * errs);
+                    }
                 }
             });
             player.prepare();

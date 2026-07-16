@@ -262,6 +262,26 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
         }
     };
 
+    // ===== PLAYBACK WATCHDOG =====
+    // A TextureView keeps its last decoded frame forever, so a player that errors,
+    // ends, or fails to get a surface leaves the screen frozen or black until the
+    // next content/layout change or an app restart. Nothing here ever noticed that.
+    // This lightweight watchdog checks the active player(s) every few seconds and
+    // rebuilds playback when they are stuck (IDLE/ENDED or drained) for two
+    // consecutive checks (~14s) — the same rebuild a dashboard content change does,
+    // just automatic. Covers single, template and grid modes.
+    private static final long WATCHDOG_MS = 7_000L;
+    private int playbackStallStrikes = 0;
+    private int singleErrorStrikes = 0;
+    private final Handler watchdogHandler = new Handler(Looper.getMainLooper());
+    private final Runnable watchdogRunnable = new Runnable() {
+        @Override
+        public void run() {
+            try { checkPlaybackHealth(); } catch (Exception e) { Log.w(TAG, "watchdog check failed", e); }
+            watchdogHandler.postDelayed(this, WATCHDOG_MS);
+        }
+    };
+
     private static final String ROOT_DIR = "video";
     private static final String TEMP_DIR = "video_new";
     private static final int MAX_RETRIES = 5;
@@ -282,6 +302,12 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
     private FrameLayout templateOverlay;
     private volatile boolean templateActive = false;
     private volatile String templateStamp = null;
+    // Zone media is served from presigned S3 URLs (7-day TTL). The template is
+    // only re-fetched when its stamp changes (a dashboard edit), so a screen left
+    // untouched past the TTL would 403 and black-box its zone videos. Force a
+    // silent re-fetch on this interval to renew the URLs well before they expire.
+    private static final long TEMPLATE_REFRESH_MS = 6 * 60 * 60 * 1000L; // 6 hours
+    private volatile long lastTemplateApplyMs = 0L;
     private final java.util.concurrent.atomic.AtomicBoolean templateFetchInProgress =
             new java.util.concurrent.atomic.AtomicBoolean(false);
     private ActivityResultLauncher<String> legacyPermLauncher;
@@ -469,6 +495,7 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
         tempHandler.removeCallbacksAndMessages(null);
         imageTimerHandler.removeCallbacksAndMessages(null);
         transitionWatcherHandler.removeCallbacksAndMessages(null);
+        watchdogHandler.removeCallbacksAndMessages(null);
         // Pause video players to release audio focus and reduce resource use
         if (player != null) {
             try { player.pause(); } catch (Exception ignored) {}
@@ -517,6 +544,9 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
         rotationPollHandler.postDelayed(rotationPollRunnable, 1000);
         tempHandler.removeCallbacksAndMessages(null);
         tempHandler.postDelayed(tempPostRunnable, TEMP_POST_INTERVAL_MS);
+        // Self-healing watchdog: recover a frozen/black player without waiting for
+        // a content change or restart. Self-guards on enrollment.
+        startWatchdog();
     }
 
     @Override
@@ -529,6 +559,7 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
         enrollmentCheckHandler.removeCallbacksAndMessages(null);
         imageTimerHandler.removeCallbacksAndMessages(null);
         transitionWatcherHandler.removeCallbacksAndMessages(null);
+        watchdogHandler.removeCallbacksAndMessages(null);
         btShouldReconnect = false;
         bleConnected = false;
         bleHandler.removeCallbacksAndMessages(null);
@@ -2365,16 +2396,28 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
             templateStamp = null;
             return;
         }
-        if (stamp.equals(templateStamp) && templateActive) return;
-        fetchAndApplyTemplate(stamp);
+        if (stamp.equals(templateStamp) && templateActive) {
+            // Unchanged content — but periodically re-fetch anyway to renew the
+            // zone media presigned URLs before they expire (silent, no hint).
+            if (System.currentTimeMillis() - lastTemplateApplyMs < TEMPLATE_REFRESH_MS) return;
+            Log.d(TAG, "Template unchanged; refresh interval elapsed — renewing zone URLs");
+            fetchAndApplyTemplate(stamp, false);
+            return;
+        }
+        fetchAndApplyTemplate(stamp, true);
     }
 
     private void fetchAndApplyTemplate(final String stamp) {
+        fetchAndApplyTemplate(stamp, true);
+    }
+
+    private void fetchAndApplyTemplate(final String stamp, final boolean showHint) {
         if (!templateFetchInProgress.compareAndSet(false, true)) return;
         // Show a brief on-screen "Updating content…" hint when a LIVE template's
         // content changes (dashboard edit), so an operator sees the box refresh
-        // instead of it happening silently. Not shown on first/offline load.
-        final boolean liveUpdate = templateActive;
+        // instead of it happening silently. Not shown on first/offline load or on
+        // a silent periodic URL-renewal refresh.
+        final boolean liveUpdate = templateActive && showHint;
         if (liveUpdate) ui.post(() -> applyDownloadOverlay(true, "Updating content…"));
         new Thread(() -> {
             boolean applied = false;
@@ -2397,6 +2440,7 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
                         .putString(PREF_TEMPLATE_JSON, sb.toString()).apply();
                 // Trust the stamp in the response (fallback to the heartbeat's).
                 templateStamp = tpl.isNull("template_stamp") ? stamp : tpl.optString("template_stamp", stamp);
+                lastTemplateApplyMs = System.currentTimeMillis();
                 ui.post(() -> applyTemplate(tpl));
                 applied = true;
             } catch (Exception e) {
@@ -3652,14 +3696,37 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
             @Override
             public void onPlayerError(PlaybackException e) {
                 Log.e(TAG, "Player error: " + e.getMessage());
-                int idx = player.getCurrentMediaItemIndex();
-                if (player.getMediaItemCount() > 0) {
+                int count = player.getMediaItemCount();
+                if (count > 1) {
+                    // Drop the offending item and keep playing the rest. Safe because
+                    // count > 1, so this can NEVER drain the playlist to empty — the
+                    // old code did, leaving a permanent black screen once the last
+                    // item errored.
+                    int idx = player.getCurrentMediaItemIndex();
                     player.removeMediaItem(idx);
-                    if (player.getMediaItemCount() > 0) {
-                        player.seekTo(Math.min(idx, player.getMediaItemCount()-1), 0);
+                    player.seekTo(Math.min(idx, player.getMediaItemCount() - 1), 0);
+                    player.prepare();
+                    player.play();
+                } else {
+                    // The only/last item errored — never remove it. Retry a few times
+                    // (transient decode/IO), then rebuild the playlist from disk. The
+                    // watchdog is the final backstop if even that stalls.
+                    if (++singleErrorStrikes <= 3) {
+                        player.seekTo(0);
+                        player.prepare();
                         player.play();
+                    } else {
+                        singleErrorStrikes = 0;
+                        ui.postDelayed(() -> {
+                            if (isEnrolled && !isShowingImage) playMixedPlaylist(ensureMainDir());
+                        }, 1500);
                     }
                 }
+            }
+
+            @Override
+            public void onPlaybackStateChanged(int state) {
+                if (state == Player.STATE_READY) singleErrorStrikes = 0; // recovered cleanly
             }
         });
     }
@@ -3686,6 +3753,68 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
 
     private File ensureMainDir() { File d = new File(Environment.getExternalStorageDirectory(), ROOT_DIR); if (!d.exists()) d.mkdirs(); return d; }
     private File ensureTempDir() { File d = new File(Environment.getExternalStorageDirectory(), TEMP_DIR); if (!d.exists()) d.mkdirs(); return d; }
+
+    // ===== PLAYBACK WATCHDOG IMPLEMENTATION =====
+    // Runs on the UI thread. Only acts when the device is enrolled, focused and
+    // meant to be showing video (not an image slideshow, not the enrollment
+    // screen). A stuck player must persist across TWO checks before we rebuild,
+    // so a legitimate buffer/transition isn't mistaken for a stall.
+    private void checkPlaybackHealth() {
+        if (!isEnrolled || isShowingImage || !hasWindowFocus()) { playbackStallStrikes = 0; return; }
+        boolean healthy = isGridMode ? gridPlaybackHealthy() : singlePlaybackHealthy();
+        if (healthy) { playbackStallStrikes = 0; return; }
+        playbackStallStrikes++;
+        Log.w(TAG, "Watchdog: playback looks stuck (mode=" + (isGridMode ? "grid" : "single")
+                + ", strike " + playbackStallStrikes + ")");
+        if (playbackStallStrikes >= 2) {
+            playbackStallStrikes = 0;
+            Log.w(TAG, "Watchdog: rebuilding playback to recover from a stall/black screen");
+            restartPlaybackForRecovery();
+        }
+    }
+
+    // Single/template mode: the one main player. Loops with REPEAT_MODE_ALL, so a
+    // healthy player is never IDLE/ENDED; those states mean it errored out or the
+    // playlist was drained to empty.
+    private boolean singlePlaybackHealthy() {
+        ExoPlayer p = player;
+        if (p == null) return true; // nothing to supervise yet (e.g. mid-rebuild)
+        if (p.getMediaItemCount() == 0) return true; // no content assigned — not a stall
+        int st = p.getPlaybackState();
+        if (st == Player.STATE_IDLE || st == Player.STATE_ENDED) return false;
+        // Ready but not advancing while we want it to play = frozen.
+        if (st == Player.STATE_READY && !p.isPlaying() && p.getPlayWhenReady()) return false;
+        return true;
+    }
+
+    // Grid mode: unhealthy if any slot that HAS media has died (IDLE/ENDED). One
+    // dead slot is a black half/quarter of the screen, so recover the whole grid.
+    private boolean gridPlaybackHealthy() {
+        for (ExoPlayer gp : gridPlayers) {
+            if (gp == null || gp.getMediaItemCount() == 0) continue;
+            int st = gp.getPlaybackState();
+            if (st == Player.STATE_IDLE || st == Player.STATE_ENDED) return false;
+        }
+        return true;
+    }
+
+    private void restartPlaybackForRecovery() {
+        try {
+            if (isGridMode && !templateActive) {
+                switchToGridMode();
+            } else {
+                playMixedPlaylist(ensureMainDir());
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "Watchdog restart failed", e);
+        }
+    }
+
+    private void startWatchdog() {
+        watchdogHandler.removeCallbacksAndMessages(null);
+        playbackStallStrikes = 0;
+        watchdogHandler.postDelayed(watchdogRunnable, WATCHDOG_MS);
+    }
     private void toast(String s) { Toast.makeText(this, s, Toast.LENGTH_LONG).show(); }
 
     // ===== BLE =====
@@ -4580,9 +4709,26 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
                 }
 
                 MediaItem item = MediaItem.fromUri(Uri.fromFile(mediaFile));
-                gridPlayers[slotIndex].setMediaItem(item);
-                gridPlayers[slotIndex].prepare();
-                gridPlayers[slotIndex].play();
+                final ExoPlayer gridPlayer = gridPlayers[slotIndex];
+                // Grid players had NO error handling — a slot that failed to prepare
+                // (corrupt file, or NO_MEMORY under up to 4 concurrent decoders) went
+                // black permanently. Retry the slot a few times; if it stays dead the
+                // watchdog (gridPlaybackHealthy) rebuilds the whole grid.
+                gridPlayer.addListener(new Player.Listener() {
+                    private int errs = 0;
+                    @Override
+                    public void onPlayerError(PlaybackException e) {
+                        if (gridPlayers[slotIndex] != gridPlayer) return; // stale (slot rebuilt)
+                        Log.e(TAG, "Grid slot " + slotIndex + " error: " + e.getMessage());
+                        if (++errs <= 3) {
+                            gridPlayer.prepare();
+                            gridPlayer.play();
+                        }
+                    }
+                });
+                gridPlayer.setMediaItem(item);
+                gridPlayer.prepare();
+                gridPlayer.play();
 
                 Log.d(TAG, "Grid slot " + slotIndex + ": " + mediaFile.getName() + " (video) rotation=" + rotation);
             }

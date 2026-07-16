@@ -319,8 +319,11 @@ public class TemplateRenderer {
         String url = content.optString("media_url", "");
         String mediaType = content.optString("media_type", "image");
         FrameLayout holder = new FrameLayout(ctx);
-        String bg = style.optString("bg_color", isQr ? "#FFFFFF" : "");
-        if (!bg.isEmpty()) holder.setBackgroundColor(parseColor(bg, isQr ? Color.WHITE : Color.TRANSPARENT));
+        // No white default for QR zones anymore: the quiet zone lives on a square
+        // card around the code (below), so an unset/non-square QR box no longer
+        // renders as a white slab. An explicitly designed background still paints.
+        String bg = style.optString("bg_color", "");
+        if (!bg.isEmpty()) holder.setBackgroundColor(parseColor(bg, Color.TRANSPARENT));
         if (url.isEmpty()) {
             return holder; // nothing to show; keep the (bg) box — never an error on screen
         }
@@ -342,11 +345,24 @@ public class TemplateRenderer {
         }
         final ImageView iv = new ImageView(ctx);
         iv.setScaleType(isQr ? ImageView.ScaleType.FIT_CENTER : scaleType(style));
-        int pad = isQr ? (int) (style.optDouble("padding_pct", 6) / 100.0 * Math.min(rect[2], rect[3])) : 0;
-        iv.setPadding(pad, pad, pad, pad);
-        FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT);
-        holder.addView(iv, lp);
+        if (isQr) {
+            // The light quiet zone a QR needs in order to scan hugs the code as a
+            // centered SQUARE card (side = the box's smaller dimension); painting
+            // the whole zone white turned non-square QR boxes into a white slab.
+            // Matches static/player.html fillQr. bg precedence: content > style > white.
+            int side = Math.min(rect[2], rect[3]);
+            int pad = (int) (style.optDouble("padding_pct", 6) / 100.0 * side);
+            FrameLayout card = new FrameLayout(ctx);
+            String cardBg = content.optString("bg_color", style.optString("bg_color", "#FFFFFF"));
+            card.setBackgroundColor(parseColor(cardBg, Color.WHITE));
+            iv.setPadding(pad, pad, pad, pad);
+            card.addView(iv, new FrameLayout.LayoutParams(
+                    FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
+            holder.addView(card, new FrameLayout.LayoutParams(side, side, Gravity.CENTER));
+        } else {
+            holder.addView(iv, new FrameLayout.LayoutParams(
+                    FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
+        }
         loadImageAsync(iv, url, Math.max(rect[2], rect[3]));
         return holder;
     }

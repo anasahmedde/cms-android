@@ -917,7 +917,9 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
             rootContainer.removeView(enrollmentOverlay);
         }
         if (downloadStatusOverlay != null && downloadStatusOverlay.getParent() != null) {
-            rootContainer.removeView(downloadStatusOverlay);
+            // May live on rootContainer OR the window content root (it reparents
+            // there when shown, to sit above the template overlay).
+            ((ViewGroup) downloadStatusOverlay.getParent()).removeView(downloadStatusOverlay);
         }
 
         // 11) Clear rootContainer and rebuild views fresh
@@ -945,9 +947,15 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
             rootContainer.addView(enrollmentOverlay);
         }
 
-        // Re-add download status overlay on top of everything
+        // Re-add download status overlay on top of everything. When it is
+        // showing, it belongs on the window content root (above any template
+        // overlay); hidden, rootContainer is fine — the next show reparents it.
         if (downloadStatusOverlay != null) {
-            rootContainer.addView(downloadStatusOverlay);
+            if (downloadStatusOverlay.getVisibility() == View.VISIBLE) {
+                applyDownloadOverlay(true, null);
+            } else {
+                rootContainer.addView(downloadStatusOverlay);
+            }
         } else {
             createDownloadStatusOverlay();
         }
@@ -1022,6 +1030,22 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
         Runnable r = () -> {
             if (downloadStatusOverlay == null) return;
             if (text != null) downloadStatusOverlay.setText(text);
+            if (show) {
+                // The template overlay lives on android.R.id.content ABOVE
+                // rootContainer, so an indicator parked in rootContainer is
+                // invisible whenever a template is active — the reported
+                // "nothing shows when I update content". Host the hint on the
+                // window content root and keep it above whatever was added since.
+                try {
+                    ViewGroup contentRoot = findViewById(android.R.id.content);
+                    if (downloadStatusOverlay.getParent() != contentRoot) {
+                        ViewGroup old = (ViewGroup) downloadStatusOverlay.getParent();
+                        if (old != null) old.removeView(downloadStatusOverlay);
+                        contentRoot.addView(downloadStatusOverlay);
+                    }
+                    downloadStatusOverlay.bringToFront();
+                } catch (Exception ignored) { }
+            }
             downloadStatusOverlay.setVisibility(show ? View.VISIBLE : View.GONE);
         };
         if (android.os.Looper.myLooper() == android.os.Looper.getMainLooper()) r.run();
@@ -2451,7 +2475,9 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
                 // or immediately if the fetch failed. applyTemplate re-adds the same
                 // overlay view on top, preserving this state until we hide it.
                 if (liveUpdate) {
-                    final long delay = applied ? 1000L : 0L;
+                    // Hold long enough that a person watching the screen actually
+                    // reads it — 1s vanished before operators noticed it.
+                    final long delay = applied ? 2500L : 0L;
                     ui.post(() -> {
                         if (downloadStatusOverlay != null)
                             downloadStatusOverlay.postDelayed(() -> applyDownloadOverlay(false, null), delay);
@@ -2532,6 +2558,12 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
             templateOverlay = templateRenderer.build(tpl);
             contentRoot.addView(templateOverlay, new FrameLayout.LayoutParams(
                     FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
+            // The fresh template overlay just landed above everything — keep the
+            // "Updating content…" hint visible THROUGH the rebuild, or a live
+            // content update shows no feedback at all.
+            if (downloadStatusOverlay != null && downloadStatusOverlay.getVisibility() == View.VISIBLE) {
+                applyDownloadOverlay(true, null);
+            }
             applyImmersive();
             Log.d(TAG, "Template applied (id=" + tpl.optString("template_id") + ", stamp=" + templateStamp + ")");
         } catch (Exception e) {

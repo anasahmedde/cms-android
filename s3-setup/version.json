@@ -1,8 +1,8 @@
 {
-  "versionCode": 9,
-  "versionName": "9.0.0",
-  "apkUrl": "https://dgx-release-bucket.s3.us-east-2.amazonaws.com/releases/app-v9.0.0.apk",
-  "checksum": "5fd06371d025fe40327b3aca188c0a94240c7132df42d9c0403478c429aa51ac",
-  "releaseNotes": "Screen templates: devices render a company's linked screen template (header/QR/media/text zones + playlist). Adds app-version reporting.",
+  "versionCode": 18,
+  "versionName": "10.1.6",
+  "apkUrl": "https://dgx-release-bucket.s3.us-east-2.amazonaws.com/releases/app-v10.1.6.apk",
+  "checksum": "847e143b2ba92709441011af39adfafe1ca8aab68151172f2507e8fa5801ac2c",
+  "releaseNotes": "Self-healing playback, cleaner QR blocks, template videos play offline, a visible 'Updating content…' indicator on every live change, and hardened media caching + polite fleet polling.",
   "forceUpdate": false
 }

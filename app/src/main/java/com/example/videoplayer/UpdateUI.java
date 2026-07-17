@@ -78,6 +78,10 @@ public class UpdateUI implements AppUpdater.UpdateListener {
     public void onError(String message) {
         Log.e(TAG, "Update error: " + message);
         dismissProgress();
+        // A failed CHECK is routine on an offline signage screen (no DNS/route)
+        // and would toast over the public content on every retry — log only.
+        // Real download/install failures still surface for the on-site tech.
+        if (message != null && message.startsWith("Update check failed")) return;
         if (!activity.isFinishing() && !activity.isDestroyed()) {
             Toast.makeText(activity, "Update error: " + message, Toast.LENGTH_LONG).show();
         }

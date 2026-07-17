@@ -114,6 +114,7 @@ public class TemplateRenderer {
 
         JSONArray zones = tpl.optJSONArray("zones");
         if (zones == null) return overlay;
+        pruneZoneCache(zones); // drop cached media this template no longer uses
 
         for (int i = 0; i < zones.length(); i++) {
             JSONObject z = zones.optJSONObject(i);
@@ -379,14 +380,37 @@ public class TemplateRenderer {
             final ExoPlayer player = new ExoPlayer.Builder(ctx).build();
             zonePlayers.add(player);
             pv.setPlayer(player);
-            player.setMediaItem(MediaItem.fromUri(url));
+            // Offline-first: play the cached copy when we have one (survives lost
+            // internet and expired presigns); stream only on first sight of a new
+            // file, while a background download fills the cache for the next
+            // build/boot. The cache key is the URL PATH, so presign renewals hit
+            // the same file and only a real content change re-downloads.
+            final File cached = cachedZoneVideo(url);
+            final boolean playingLocal = cached != null;
+            player.setMediaItem(MediaItem.fromUri(playingLocal
+                    ? android.net.Uri.fromFile(cached).toString() : url));
             player.setRepeatMode(Player.REPEAT_MODE_ALL);
             player.setVolume(0f); // the main playlist owns audio
             player.setPlayWhenReady(true);
             player.addListener(new Player.Listener() {
                 private int errs = 0;
+                private boolean fellBack = false;
                 @Override public void onPlayerError(PlaybackException error) {
-                    Log.w(TAG, "zone video error (" + url + "): " + error.getErrorCodeName());
+                    Log.w(TAG, "zone video error (" + (playingLocal && !fellBack ? "cache" : "stream")
+                            + " " + url + "): " + error.getErrorCodeName());
+                    // A corrupt cached file can never recover — drop it and fall
+                    // back to streaming the source once (re-cached in background).
+                    if (playingLocal && !fellBack) {
+                        fellBack = true;
+                        try { cached.delete(); } catch (Exception ignored) { }
+                        downloadZoneVideoAsync(url);
+                        try {
+                            player.setMediaItem(MediaItem.fromUri(url));
+                            player.prepare();
+                            player.play();
+                            return;
+                        } catch (Exception ignored) { }
+                    }
                     // Bounded re-prepare handles a transient network stall so the box
                     // doesn't stay black. A hard failure (e.g. the presigned URL has
                     // expired — a 403) can't recover from the same URL: the activity's
@@ -401,6 +425,7 @@ public class TemplateRenderer {
             player.prepare();
             holder.addView(pv, new FrameLayout.LayoutParams(
                     FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
+            if (!playingLocal) downloadZoneVideoAsync(url);
         } catch (Exception e) {
             Log.w(TAG, "zone video setup failed: " + e.getMessage());
         }
@@ -417,6 +442,108 @@ public class TemplateRenderer {
     private ImageView.ScaleType scaleType(JSONObject style) {
         String fit = style.optString("fit_mode", "cover");
         return "contain".equals(fit) ? ImageView.ScaleType.FIT_CENTER : ImageView.ScaleType.CENTER_CROP;
+    }
+
+    // ── Zone media cache (filesDir/tpl) ──────────────────────────────────────
+    // Keyed by URL PATH (presign query stripped), same convention as the image
+    // cache, so renewed presigns keep hitting the same file and only a real
+    // content change (new S3 key) downloads again.
+
+    private static final long MAX_ZONE_VIDEO_BYTES = 512L * 1024 * 1024; // storage guard
+    private static final java.util.Set<String> zoneDownloadsInFlight =
+            java.util.Collections.synchronizedSet(new java.util.HashSet<String>());
+
+    private File tplCacheDir() {
+        File dir = new File(ctx.getFilesDir(), "tpl");
+        if (!dir.exists()) dir.mkdirs();
+        return dir;
+    }
+
+    private static String cacheName(String url, String ext) {
+        String key = url.contains("?") ? url.substring(0, url.indexOf('?')) : url;
+        return Integer.toHexString(key.hashCode()) + ext;
+    }
+
+    /** The cached copy of a zone video, or null when not (fully) downloaded yet. */
+    private File cachedZoneVideo(String url) {
+        File f = new File(tplCacheDir(), cacheName(url, ".vid"));
+        return f.exists() && f.length() > 0 ? f : null;
+    }
+
+    /**
+     * Download a zone video to the cache in the background (temp file + atomic
+     * rename, so a torn download never plays). The CURRENT playback keeps
+     * streaming; the cached copy takes over on the next template build/boot —
+     * from then on the box plays with no internet at all.
+     */
+    private void downloadZoneVideoAsync(final String url) {
+        final String name = cacheName(url, ".vid");
+        if (!zoneDownloadsInFlight.add(name)) return; // already downloading
+        new Thread(() -> {
+            File tmp = new File(tplCacheDir(), name + ".part");
+            try {
+                HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
+                c.setConnectTimeout(CONNECT_TIMEOUT_MS);
+                c.setReadTimeout(READ_TIMEOUT_MS);
+                long len = c.getContentLengthLong();
+                if (len > MAX_ZONE_VIDEO_BYTES) {
+                    Log.w(TAG, "zone video too large to cache (" + len + "b): " + url);
+                    c.disconnect();
+                    return;
+                }
+                try (InputStream in = c.getInputStream(); FileOutputStream out = new FileOutputStream(tmp)) {
+                    byte[] buf = new byte[65536];
+                    int n;
+                    while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
+                } finally {
+                    c.disconnect();
+                }
+                File dst = new File(tplCacheDir(), name);
+                if (!tmp.renameTo(dst)) {
+                    tmp.delete();
+                } else {
+                    Log.d(TAG, "zone video cached (" + dst.length() + "b): " + url);
+                }
+            } catch (Exception e) {
+                Log.w(TAG, "zone video cache failed (" + url + "): " + e.getMessage());
+                tmp.delete();
+            } finally {
+                zoneDownloadsInFlight.remove(name);
+            }
+        }).start();
+    }
+
+    /**
+     * Delete cached zone media the current template no longer references —
+     * a content change swaps the S3 key, so the old file would sit on disk
+     * forever otherwise. In-flight downloads (.part) are left alone.
+     */
+    private void pruneZoneCache(JSONArray zones) {
+        java.util.Set<String> wanted = new java.util.HashSet<>();
+        for (int i = 0; i < zones.length(); i++) {
+            JSONObject z = zones.optJSONObject(i);
+            if (z == null) continue;
+            JSONObject c = z.optJSONObject("content");
+            if (c == null) continue;
+            String media = c.optString("media_url", "");
+            if (!media.isEmpty()) {
+                wanted.add(cacheName(media, ".vid"));
+                wanted.add(cacheName(media, ".img"));
+            }
+            String bg = c.optString("bg_image", "");
+            if (!bg.isEmpty()) wanted.add(cacheName(bg, ".img"));
+        }
+        new Thread(() -> {
+            File[] files = tplCacheDir().listFiles();
+            if (files == null) return;
+            for (File f : files) {
+                String n = f.getName();
+                if (n.endsWith(".part")) continue; // in-flight download
+                if (!wanted.contains(n) && f.delete()) {
+                    Log.d(TAG, "pruned stale zone media: " + n);
+                }
+            }
+        }).start();
     }
 
     /** Download+cache (by URL path, so presign query changes don't re-download) and decode sampled. */

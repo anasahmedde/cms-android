@@ -561,13 +561,19 @@ public class TemplateRenderer {
             if (!dir.exists()) dir.mkdirs();
             File f = new File(dir, Integer.toHexString(cacheKey.hashCode()) + ".img");
             if (!f.exists() || f.length() == 0) {
+                // Atomic write (temp + rename, like the video cache): a
+                // connection drop mid-download used to leave a truncated .img
+                // that decoded to null and was cached FOREVER — the box stayed
+                // blank until a content change moved the URL.
+                File tmp = new File(dir, f.getName() + ".part");
                 HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
                 c.setConnectTimeout(CONNECT_TIMEOUT_MS);
                 c.setReadTimeout(READ_TIMEOUT_MS);
-                try (InputStream in = c.getInputStream(); FileOutputStream out = new FileOutputStream(f)) {
+                try (InputStream in = c.getInputStream(); FileOutputStream out = new FileOutputStream(tmp)) {
                     byte[] buf = new byte[8192]; int n;
                     while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
                 } finally { c.disconnect(); }
+                if (!tmp.renameTo(f)) { tmp.delete(); return null; }
             }
             // Sample to the target size to avoid OOM on large images.
             BitmapFactory.Options bounds = new BitmapFactory.Options();
@@ -578,7 +584,14 @@ public class TemplateRenderer {
             while (targetPx > 0 && longest / sample > targetPx * 2) sample *= 2;
             BitmapFactory.Options opts = new BitmapFactory.Options();
             opts.inSampleSize = sample;
-            return BitmapFactory.decodeFile(f.getAbsolutePath(), opts);
+            Bitmap bmp = BitmapFactory.decodeFile(f.getAbsolutePath(), opts);
+            if (bmp == null) {
+                // Undecodable cached file (corrupt survivor from the pre-atomic
+                // era, or a bad object) — delete it so the next build retries.
+                Log.w(TAG, "cached image undecodable, deleting: " + f.getName());
+                f.delete();
+            }
+            return bmp;
         } catch (Exception e) {
             Log.w(TAG, "template image load failed: " + url, e);
             return null;

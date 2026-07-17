@@ -169,7 +169,7 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
         @Override
         public void run() {
             checkEnrollmentStatus();
-            enrollmentCheckHandler.postDelayed(this, ENROLLMENT_CHECK_MS);
+            enrollmentCheckHandler.postDelayed(this, jittered(ENROLLMENT_CHECK_MS));
         }
     };
 
@@ -247,18 +247,38 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
         @Override
         public void run() {
             pollRotationMetadata();
-            rotationPollHandler.postDelayed(this, ROTATION_POLL_MS);
+            rotationPollHandler.postDelayed(this, jittered(ROTATION_POLL_MS));
         }
     };
 
     private static final long POLL_MS = 30_000L; // 30 seconds heartbeat
     private final Handler pollHandler = new Handler(Looper.getMainLooper());
+
+    // ── Poll pacing ─────────────────────────────────────────────────────────
+    // Fixed intervals synchronize the fleet into request herds: after a shared
+    // outage or a backend deploy every device retries in lockstep, and during
+    // an outage each keeps hammering at full cadence. Jitter (±15%) spreads
+    // devices across the window; consecutive heartbeat failures back off
+    // exponentially to a 5-minute cap and reset on the first success.
+    private static final long MAX_BACKOFF_MS = 5 * 60_000L;
+    private volatile int heartbeatFailures = 0;
+
+    private static long jittered(long baseMs) {
+        return baseMs + (long) ((Math.random() - 0.5) * 0.3 * baseMs);
+    }
+
+    private long heartbeatDelay() {
+        int f = heartbeatFailures;
+        if (f <= 0) return jittered(POLL_MS);
+        return jittered(Math.min(MAX_BACKOFF_MS, POLL_MS << Math.min(f, 4)));
+    }
+
     private final Runnable pollRunnable = new Runnable() {
         @Override
         public void run() {
             sendOnlineHeartbeat();
             startBackgroundCheckIfNeeded();
-            pollHandler.postDelayed(this, POLL_MS);
+            pollHandler.postDelayed(this, heartbeatDelay());
         }
     };
 
@@ -2291,6 +2311,7 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
         new Thread(() -> {
             try {
                 boolean stillActive = postOnlineAndCheckStatus(updateOnlineUrl(getAndroidId()));
+                heartbeatFailures = 0; // reachable again — resume normal cadence
                 if (!stillActive) {
                     // Device deleted/deactivated or company expired — full teardown
                     // (playback + template overlay + re-armed enrollment watchdog)
@@ -2304,7 +2325,8 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
                     });
                 }
             } catch (Exception e) {
-                Log.e(TAG, "Heartbeat error: " + e.getMessage());
+                heartbeatFailures++; // next poll backs off (capped at 5 min)
+                Log.e(TAG, "Heartbeat error (" + heartbeatFailures + " consecutive): " + e.getMessage());
             }
         }).start();
     }

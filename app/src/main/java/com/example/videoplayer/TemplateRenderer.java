@@ -238,7 +238,7 @@ public class TemplateRenderer {
             final String url = img;
             final int target = Math.max(rect[2], rect[3]);
             new Thread(() -> {
-                final Bitmap b = downloadAndDecode(url, url.contains("?") ? url.substring(0, url.indexOf('?')) : url, target);
+                final Bitmap b = downloadAndDecode(url, target);
                 if (b != null) ui.post(() -> tv.setBackground(new BitmapDrawable(ctx.getResources(), b)));
             }).start();
             return;
@@ -336,6 +336,10 @@ public class TemplateRenderer {
             holder.setBackgroundColor(Color.BLACK);
         }
         if ("video".equals(mediaType) && !isQr) {
+            // Warm the offline cache on every build, not only once streaming
+            // starts — a restart mid-download or a budget-blocked zone must
+            // still end up cached for the next offline boot.
+            if (cachedZoneVideo(url) == null) downloadZoneVideoAsync(url);
             if (zonePlayers.size() >= MAX_ZONE_VIDEO_PLAYERS) {
                 // Over the decoder budget: paint an opaque box so the main
                 // playlist video behind the transparent overlay doesn't bleed
@@ -407,7 +411,11 @@ public class TemplateRenderer {
                             + " " + url + "): " + error.getErrorCodeName());
                     // A corrupt cached file can never recover — drop it and fall
                     // back to streaming the source once (re-cached in background).
-                    if (playingLocal && !fellBack) {
+                    // ONLY while online: offline, the cached copy is ALL we have —
+                    // deleting it on a transient decode error would leave the box
+                    // permanently black across offline reboots. Keep it and retry
+                    // below; once online, a real corruption still falls through here.
+                    if (playingLocal && !fellBack && isOnline()) {
                         fellBack = true;
                         try { cached.delete(); } catch (Exception ignored) { }
                         downloadZoneVideoAsync(url);
@@ -467,8 +475,33 @@ public class TemplateRenderer {
     }
 
     private static String cacheName(String url, String ext) {
-        String key = url.contains("?") ? url.substring(0, url.indexOf('?')) : url;
+        // Key by URL PATH only. The presign QUERY changes on every renewal and
+        // the S3 HOST form can flip (bucket.s3.amazonaws.com vs regional
+        // endpoint) — neither is a content change, and a host-keyed cache
+        // silently misses after either, which breaks offline playback. Only a
+        // real S3 key change should re-download.
+        String key = url;
+        int q = key.indexOf('?');
+        if (q >= 0) key = key.substring(0, q);
+        int scheme = key.indexOf("://");
+        if (scheme >= 0) {
+            int slash = key.indexOf('/', scheme + 3);
+            if (slash >= 0) key = key.substring(slash);
+        }
         return Integer.toHexString(key.hashCode()) + ext;
+    }
+
+    /** Best-effort connectivity check — decides whether a cache-playback error
+     *  may fall back to streaming (and re-downloading) or must keep the file. */
+    private boolean isOnline() {
+        try {
+            android.net.ConnectivityManager cm = (android.net.ConnectivityManager)
+                    ctx.getSystemService(android.content.Context.CONNECTIVITY_SERVICE);
+            android.net.NetworkInfo ni = cm == null ? null : cm.getActiveNetworkInfo();
+            return ni != null && ni.isConnected();
+        } catch (Exception e) {
+            return true; // unknown → assume online (old behavior)
+        }
     }
 
     /** The cached copy of a zone video, or null when not (fully) downloaded yet. */
@@ -555,18 +588,19 @@ public class TemplateRenderer {
 
     /** Download+cache (by URL path, so presign query changes don't re-download) and decode sampled. */
     private void loadImageAsync(final ImageView iv, final String url, final int targetPx) {
-        final String cacheKey = url.contains("?") ? url.substring(0, url.indexOf('?')) : url;
         new Thread(() -> {
-            final Bitmap bmp = downloadAndDecode(url, cacheKey, targetPx);
+            final Bitmap bmp = downloadAndDecode(url, targetPx);
             if (bmp != null) ui.post(() -> iv.setImageBitmap(bmp));
         }).start();
     }
 
-    private Bitmap downloadAndDecode(String url, String cacheKey, int targetPx) {
+    private Bitmap downloadAndDecode(String url, int targetPx) {
         try {
             File dir = new File(ctx.getFilesDir(), "tpl");
             if (!dir.exists()) dir.mkdirs();
-            File f = new File(dir, Integer.toHexString(cacheKey.hashCode()) + ".img");
+            // Same naming as the video cache + pruneZoneCache's wanted-set —
+            // one formula, or the pruner deletes live cache files.
+            File f = new File(dir, cacheName(url, ".img"));
             if (!f.exists() || f.length() == 0) {
                 // Atomic write (temp + rename, like the video cache): a
                 // connection drop mid-download used to leave a truncated .img

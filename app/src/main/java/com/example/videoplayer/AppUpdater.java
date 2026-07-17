@@ -75,6 +75,23 @@ public class AppUpdater {
         this.listener = listener;
     }
 
+    /**
+     * Stable 0-99 rollout bucket for this device, derived from its persisted
+     * device id — the same screens are always the early cohort, so a canary
+     * problem is reproducible instead of roving. rolloutPercent=N updates
+     * buckets 0..N-1.
+     */
+    static int rolloutBucket(Context ctx) {
+        try {
+            String id = DeviceIdentity.get(ctx);
+            int h = 0;
+            for (int i = 0; i < id.length(); i++) h = 31 * h + id.charAt(i);
+            return Math.floorMod(h, 100);
+        } catch (Exception e) {
+            return 0; // fail OPEN: an id problem must never block updates
+        }
+    }
+
     // ── Check ─────────────────────────────────────────────────────────────────
 
     /** Fetch version.json from S3 in a background thread and compare with current build. */
@@ -107,12 +124,29 @@ public class AppUpdater {
                 String checksum   = json.optString("checksum", "");
                 String notes      = json.optString("releaseNotes", "");
                 boolean force     = json.optBoolean("forceUpdate", false);
+                // Staged-rollout brakes: rolloutPercent (0-100, default 100 =
+                // everyone) limits a release to a stable device cohort;
+                // minVersionCode force-floors devices below it regardless of
+                // cohort, so a critical fix can't be dodged by an unlucky bucket.
+                int rolloutPercent = json.optInt("rolloutPercent", 100);
+                int minVersionCode = json.optInt("minVersionCode", 0);
 
                 Log.d(TAG, "Remote versionCode=" + remoteCode +
-                        "  current=" + currentVersionCode);
+                        "  current=" + currentVersionCode +
+                        "  rollout=" + rolloutPercent + "% bucket=" + rolloutBucket(ctx));
 
                 if (remoteCode <= currentVersionCode) {
                     Log.d(TAG, "App is up to date.");
+                    return;
+                }
+                // forceUpdate keeps its fleet-wide semantics ("mandatory,
+                // everyone") — it bypasses the cohort gate. minVersionCode
+                // force-floors stragglers regardless of bucket.
+                if (!force
+                        && currentVersionCode >= minVersionCode
+                        && rolloutBucket(ctx) >= rolloutPercent) {
+                    Log.d(TAG, "Update " + remoteCode + " gated to " + rolloutPercent
+                            + "% — this device waits for a wider rollout.");
                     return;
                 }
 

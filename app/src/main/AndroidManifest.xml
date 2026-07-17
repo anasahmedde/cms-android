@@ -33,6 +33,10 @@
     <!-- Full-screen intent: launch activity from lock screen / screen-off
          (same mechanism as alarm/phone apps). Auto-granted on install. -->
     <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
+    <!-- Crash-relaunch on Android 10+: overlay holders are exempt from
+         background-activity-launch blocking. Granted once at provisioning
+         (Settings > Display over other apps, or appops via adb/MDM). -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
 
     <!-- Dismiss keyguard to show above lock screen -->
     <uses-permission android:name="android.permission.DISABLE_KEYGUARD" />
@@ -86,6 +90,7 @@
         android:required="false" />
 
     <application
+        android:name=".DgxApp"
         android:icon="@mipmap/ic_launcher"
         android:roundIcon="@mipmap/ic_launcher_round"
         android:banner="@mipmap/ic_launcher"

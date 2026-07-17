@@ -371,6 +371,9 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
         getWindow().setBackgroundDrawableResource(android.R.color.black);
 
         super.onCreate(savedInstanceState);
+        // We're up — cancel any pending crash-relaunch alarm so it can't
+        // CLEAR_TASK this healthy instance a few seconds from now.
+        DgxApp.cancelRelaunchAlarms(this);
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
 
         // At boot the screen is OFF and the lock screen is active.
@@ -2346,10 +2349,30 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
 
         try (DataOutputStream out = new DataOutputStream(c.getOutputStream())) {
             // Include app_version so the fleet is visible in the dashboard (heartbeat
-            // is the only signal that reaches every device).
+            // is the only signal that reaches every device), plus crash telemetry
+            // from the DgxApp supervisor — a crash-looping cohort must be visible
+            // in the dashboard within a heartbeat, not discovered on site.
+            // crash_count is a monotonic GAUGE (device-lifetime total), not a
+            // delta: retransmits after a lost response are idempotent and no
+            // reset handshake exists to drift out of sync. overlay_ok reports
+            // whether crash-relaunch works on this box (Android 10+ needs the
+            // "Display over other apps" grant) so un-provisioned screens are
+            // visible in the dashboard instead of discovered on site.
+            android.content.SharedPreferences cp =
+                    getSharedPreferences(DgxApp.CRASH_PREFS, MODE_PRIVATE);
+            int crashTotal = cp.getInt(DgxApp.K_COUNT_TOTAL, 0);
+            long lastCrashAt = cp.getLong(DgxApp.K_LAST_AT, 0);
+            String lastCrashMsg = cp.getString(DgxApp.K_LAST_MSG, "");
+            boolean overlayOk = android.os.Build.VERSION.SDK_INT < 23
+                    || android.provider.Settings.canDrawOverlays(this);
             String body = "{\"is_online\": true, \"resolution\": \""
                     + screenWidth + "x" + screenHeight + "\", \"app_version\": \""
-                    + BuildConfig.VERSION_NAME + "\"}";
+                    + BuildConfig.VERSION_NAME + "\""
+                    + ", \"crash_count\": " + crashTotal
+                    + ", \"last_crash_at\": " + lastCrashAt
+                    + ", \"last_crash_msg\": " + JSONObject.quote(lastCrashMsg == null ? "" : lastCrashMsg)
+                    + ", \"overlay_ok\": " + overlayOk
+                    + "}";
             out.write(body.getBytes(StandardCharsets.UTF_8));
         }
 

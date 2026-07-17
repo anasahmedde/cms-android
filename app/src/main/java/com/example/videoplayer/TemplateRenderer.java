@@ -328,6 +328,13 @@ public class TemplateRenderer {
         if (url.isEmpty()) {
             return holder; // nothing to show; keep the (bg) box — never an error on screen
         }
+        // fit=contain letterboxes media inside the zone — the leftover area was
+        // TRANSPARENT, so the fullscreen playlist video bled through around the
+        // contained media and read as broken ("small video inside another
+        // video"). Back the zone with opaque black (designer bg still wins).
+        if (!isQr && bg.isEmpty() && "contain".equals(style.optString("fit_mode", "cover"))) {
+            holder.setBackgroundColor(Color.BLACK);
+        }
         if ("video".equals(mediaType) && !isQr) {
             if (zonePlayers.size() >= MAX_ZONE_VIDEO_PLAYERS) {
                 // Over the decoder budget: paint an opaque box so the main

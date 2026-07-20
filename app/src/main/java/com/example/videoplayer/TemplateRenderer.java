@@ -288,9 +288,17 @@ public class TemplateRenderer {
             // Auto-fit: text shrinks to fit the box no matter how long it is.
             // The designer's font_size_vh becomes the MAX; text scales down (to a
             // small floor) so nothing overflows or gets clipped.
+            // With the designer's "Auto-fit text" checkbox (style.text_fit=fill —
+            // the text twin of media fit=fill) the words also GROW: the cap is
+            // the ZONE height instead of the designed size, and the text centers
+            // both ways, so it always fills the box as large as it fits.
             tv.setMaxLines(20);
             tv.setEllipsize(android.text.TextUtils.TruncateAt.END);
-            int maxPx = Math.max(dp(11), Math.round(tv.getTextSize()));
+            boolean fillFit = "fill".equals(style.optString("text_fit", ""));
+            if (fillFit) tv.setGravity(Gravity.CENTER);
+            int maxPx = fillFit
+                    ? Math.max(dp(12), Math.round(rect[3] * 0.95f))
+                    : Math.max(dp(11), Math.round(tv.getTextSize()));
             int minPx = dp(8);
             if (minPx < maxPx) {
                 try {

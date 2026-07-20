@@ -328,11 +328,14 @@ public class TemplateRenderer {
         if (url.isEmpty()) {
             return holder; // nothing to show; keep the (bg) box — never an error on screen
         }
-        // fit=contain letterboxes media inside the zone — the leftover area was
-        // TRANSPARENT, so the fullscreen playlist video bled through around the
-        // contained media and read as broken ("small video inside another
-        // video"). Back the zone with opaque black (designer bg still wins).
-        if (!isQr && bg.isEmpty() && "contain".equals(style.optString("fit_mode", "cover"))) {
+        // fit=contain letterboxes media inside the zone (and fit=none can leave
+        // gaps) — the leftover area was TRANSPARENT, so the fullscreen playlist
+        // video bled through around the contained media and read as broken
+        // ("small video inside another video"). Back the zone with opaque black
+        // (designer bg still wins). cover/fill always paint the whole zone, so
+        // they need no backing.
+        String fitMode = style.optString("fit_mode", "cover");
+        if (!isQr && bg.isEmpty() && ("contain".equals(fitMode) || "none".equals(fitMode))) {
             holder.setBackgroundColor(Color.BLACK);
         }
         if ("video".equals(mediaType) && !isQr) {
@@ -384,10 +387,21 @@ public class TemplateRenderer {
         try {
             PlayerView pv = new PlayerView(ctx);
             pv.setUseController(false);
-            boolean contain = "contain".equals(style.optString("fit_mode", "cover"));
-            pv.setResizeMode(contain
-                    ? AspectRatioFrameLayout.RESIZE_MODE_FIT
-                    : AspectRatioFrameLayout.RESIZE_MODE_ZOOM);
+            // Same fit vocabulary as the playlist path (applyTextureViewTransform)
+            // and the web player: fill = stretch to the whole zone (no crop, no
+            // bars, may distort). ExoPlayer has no "original size" mode, so none
+            // falls back to FIT — the no-crop, no-distort rendering.
+            int resizeMode;
+            switch (style.optString("fit_mode", "cover")) {
+                case "contain":
+                case "none":
+                    resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT; break;
+                case "fill":
+                    resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FILL; break;
+                default:
+                    resizeMode = AspectRatioFrameLayout.RESIZE_MODE_ZOOM;
+            }
+            pv.setResizeMode(resizeMode);
             final ExoPlayer player = new ExoPlayer.Builder(ctx).build();
             zonePlayers.add(player);
             pv.setPlayer(player);
@@ -455,8 +469,16 @@ public class TemplateRenderer {
     }
 
     private ImageView.ScaleType scaleType(JSONObject style) {
-        String fit = style.optString("fit_mode", "cover");
-        return "contain".equals(fit) ? ImageView.ScaleType.FIT_CENTER : ImageView.ScaleType.CENTER_CROP;
+        switch (style.optString("fit_mode", "cover")) {
+            case "contain":
+                return ImageView.ScaleType.FIT_CENTER;
+            case "fill":   // stretch: fill the whole zone, no crop/bars, may distort
+                return ImageView.ScaleType.FIT_XY;
+            case "none":   // original size, centered (cropped if larger than the zone)
+                return ImageView.ScaleType.CENTER;
+            default:
+                return ImageView.ScaleType.CENTER_CROP;
+        }
     }
 
     // ── Zone media cache (filesDir/tpl) ──────────────────────────────────────

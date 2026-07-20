@@ -328,14 +328,19 @@ public class TemplateRenderer {
         if (url.isEmpty()) {
             return holder; // nothing to show; keep the (bg) box — never an error on screen
         }
+        // QR boxes with an EXPLICIT fit (sheet fit column / dashboard Fit
+        // dropdown) render like media boxes — no quiet-zone card, the image
+        // fills the box per the fit. Blank fit keeps the square scannable
+        // card below, which is what generated QR codes need.
+        String fitMode = style.optString("fit_mode", "cover");
+        boolean qrCard = isQr && style.optString("fit_mode", "").isEmpty();
         // fit=contain letterboxes media inside the zone (and fit=none can leave
         // gaps) — the leftover area was TRANSPARENT, so the fullscreen playlist
         // video bled through around the contained media and read as broken
         // ("small video inside another video"). Back the zone with opaque black
         // (designer bg still wins). cover/fill always paint the whole zone, so
         // they need no backing.
-        String fitMode = style.optString("fit_mode", "cover");
-        if (!isQr && bg.isEmpty() && ("contain".equals(fitMode) || "none".equals(fitMode))) {
+        if (!qrCard && bg.isEmpty() && ("contain".equals(fitMode) || "none".equals(fitMode))) {
             holder.setBackgroundColor(Color.BLACK);
         }
         if ("video".equals(mediaType) && !isQr) {
@@ -356,11 +361,11 @@ public class TemplateRenderer {
             return holder;
         }
         if ("video".equals(mediaType)) {
-            return holder; // QR zones are image-only
+            return holder; // QR zones are image-only (with or without a fit)
         }
         final ImageView iv = new ImageView(ctx);
-        iv.setScaleType(isQr ? ImageView.ScaleType.FIT_CENTER : scaleType(style));
-        if (isQr) {
+        iv.setScaleType(qrCard ? ImageView.ScaleType.FIT_CENTER : scaleType(style));
+        if (qrCard) {
             // The light quiet zone a QR needs in order to scan hugs the code as a
             // centered SQUARE card (side = the box's smaller dimension); painting
             // the whole zone white turned non-square QR boxes into a white slab.

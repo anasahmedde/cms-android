@@ -1,9 +1,9 @@
 {
-  "versionCode": 22,
-  "versionName": "10.2.3",
-  "apkUrl": "https://dgx-release-bucket.s3.us-east-2.amazonaws.com/releases/app-v10.2.3.apk",
-  "checksum": "f700797abd74d18906abb662617ea2da9496c1eeafe9d42a156c01cfc42842ee",
-  "releaseNotes": "Production move + layout release: this update connects the screen to the production dashboard (cms.wizioners.com) \u2014 approve it and re-add the screen there if it shows the enrollment code. New: stretch fit for images/videos and QR boxes, auto-fit centered text, per-item text updates from the bulk sheet.",
+  "versionCode": 23,
+  "versionName": "10.2.4",
+  "apkUrl": "https://dgx-release-bucket.s3.us-east-2.amazonaws.com/releases/app-v10.2.4.apk",
+  "checksum": "dcb16cee87e32182cdfc4af235c7283e1cdc6beb1d99179e3dfa2b6e0549832c",
+  "releaseNotes": "Reliability update: videos now keep playing without internet in every case — flaky wifi can no longer wipe the offline copy, and interrupted downloads finish by themselves.",
   "forceUpdate": false,
   "rolloutPercent": 100
 }

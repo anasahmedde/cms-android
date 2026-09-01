@@ -355,6 +355,7 @@ public class TemplateRenderer {
             // Warm the offline cache on every build, not only once streaming
             // starts — a restart mid-download or a budget-blocked zone must
             // still end up cached for the next offline boot.
+            wantedVideoUrls.put(cacheName(url, ".vid"), url);
             if (cachedZoneVideo(url) == null) downloadZoneVideoAsync(url);
             if (zonePlayers.size() >= MAX_ZONE_VIDEO_PLAYERS) {
                 // Over the decoder budget: paint an opaque box so the main
@@ -433,18 +434,21 @@ public class TemplateRenderer {
             player.addListener(new Player.Listener() {
                 private int errs = 0;
                 private boolean fellBack = false;
+                private boolean restored = false;
                 @Override public void onPlayerError(PlaybackException error) {
                     Log.w(TAG, "zone video error (" + (playingLocal && !fellBack ? "cache" : "stream")
                             + " " + url + "): " + error.getErrorCodeName());
-                    // A corrupt cached file can never recover — drop it and fall
-                    // back to streaming the source once (re-cached in background).
-                    // ONLY while online: offline, the cached copy is ALL we have —
-                    // deleting it on a transient decode error would leave the box
-                    // permanently black across offline reboots. Keep it and retry
-                    // below; once online, a real corruption still falls through here.
+                    // A corrupt cached file can never recover — QUARANTINE it
+                    // (rename to .bad, never delete) and fall back to streaming
+                    // once, while a fresh download replaces it in the background.
+                    // ONLY while online (validated internet): offline, the cached
+                    // copy is ALL we have. If streaming then fails anyway (the
+                    // network was lying, or it dropped mid-fallback), the .bad
+                    // file is restored below — the only copy is never destroyed.
                     if (playingLocal && !fellBack && isOnline()) {
                         fellBack = true;
-                        try { cached.delete(); } catch (Exception ignored) { }
+                        File bad = new File(tplCacheDir(), cacheName(url, ".vid") + ".bad");
+                        try { cached.renameTo(bad); } catch (Exception ignored) { }
                         downloadZoneVideoAsync(url);
                         try {
                             player.setMediaItem(MediaItem.fromUri(url));
@@ -452,6 +456,26 @@ public class TemplateRenderer {
                             player.play();
                             return;
                         } catch (Exception ignored) { }
+                    }
+                    if (fellBack && !restored) {
+                        // The stream fallback itself is failing. Prefer a freshly
+                        // downloaded copy if one landed; otherwise put the
+                        // quarantined file back — the original error was most
+                        // likely a transient decode stall, not corruption.
+                        restored = true;
+                        File orig = new File(tplCacheDir(), cacheName(url, ".vid"));
+                        File bad = new File(tplCacheDir(), cacheName(url, ".vid") + ".bad");
+                        File src = (orig.exists() && orig.length() > 0) ? orig
+                                : (bad.exists() && bad.renameTo(orig)) ? orig : null;
+                        if (src != null) {
+                            Log.w(TAG, "zone video stream fallback failed — restoring cached copy: " + url);
+                            try {
+                                player.setMediaItem(MediaItem.fromUri(android.net.Uri.fromFile(src).toString()));
+                                player.prepare();
+                                player.play();
+                                return;
+                            } catch (Exception ignored) { }
+                        }
                     }
                     // Bounded re-prepare handles a transient network stall so the box
                     // doesn't stay black. A hard failure (e.g. the presigned URL has
@@ -479,6 +503,10 @@ public class TemplateRenderer {
             try { p.release(); } catch (Exception ignored) { }
         }
         zonePlayers.clear();
+        // The next build repopulates these; a stale entry would keep retrying
+        // downloads for media the template no longer shows.
+        wantedVideoUrls.clear();
+        synchronized (zoneDownloadRetries) { zoneDownloadRetries.clear(); }
     }
 
     private ImageView.ScaleType scaleType(JSONObject style) {
@@ -502,6 +530,11 @@ public class TemplateRenderer {
     private static final long MAX_ZONE_VIDEO_BYTES = 512L * 1024 * 1024; // storage guard
     private static final java.util.Set<String> zoneDownloadsInFlight =
             java.util.Collections.synchronizedSet(new java.util.HashSet<String>());
+    // cacheName -> freshest URL for every video currently on the template, so
+    // failed cache-fills can retry (with the newest presign) until they land.
+    private final java.util.Map<String, String> wantedVideoUrls =
+            java.util.Collections.synchronizedMap(new java.util.HashMap<String, String>());
+    private final java.util.Map<String, Integer> zoneDownloadRetries = new java.util.HashMap<>();
 
     private File tplCacheDir() {
         File dir = new File(ctx.getFilesDir(), "tpl");
@@ -532,7 +565,20 @@ public class TemplateRenderer {
         try {
             android.net.ConnectivityManager cm = (android.net.ConnectivityManager)
                     ctx.getSystemService(android.content.Context.CONNECTIVITY_SERVICE);
-            android.net.NetworkInfo ni = cm == null ? null : cm.getActiveNetworkInfo();
+            if (cm == null) return true;
+            if (android.os.Build.VERSION.SDK_INT >= 23) {
+                // VALIDATED = Android's captive-portal probe confirmed REAL
+                // internet. A shop router with a dead upstream stays
+                // "connected" but loses VALIDATED within seconds — treating
+                // that as online is what used to delete the only cached copy
+                // and then fail to stream ("video sometimes gone offline").
+                android.net.Network n = cm.getActiveNetwork();
+                android.net.NetworkCapabilities caps = n == null ? null : cm.getNetworkCapabilities(n);
+                return caps != null
+                        && caps.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                        && caps.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_VALIDATED);
+            }
+            android.net.NetworkInfo ni = cm.getActiveNetworkInfo();
             return ni != null && ni.isConnected();
         } catch (Exception e) {
             return true; // unknown → assume online (old behavior)
@@ -578,14 +624,42 @@ public class TemplateRenderer {
                     tmp.delete();
                 } else {
                     Log.d(TAG, "zone video cached (" + dst.length() + "b): " + url);
+                    synchronized (zoneDownloadRetries) { zoneDownloadRetries.remove(name); }
+                    // A fresh good copy supersedes any quarantined one.
+                    new File(tplCacheDir(), name + ".bad").delete();
                 }
             } catch (Exception e) {
                 Log.w(TAG, "zone video cache failed (" + url + "): " + e.getMessage());
                 tmp.delete();
+                scheduleZoneVideoRetry(name);
             } finally {
                 zoneDownloadsInFlight.remove(name);
             }
         }).start();
+    }
+
+    /**
+     * A failed cache-fill retries with backoff while its video is still on the
+     * template. Without this, a download that died mid-outage never completed
+     * until the next content change — and the NEXT outage found no cached copy
+     * ("videos sometimes don't play offline").
+     */
+    private void scheduleZoneVideoRetry(final String name) {
+        int attempt;
+        synchronized (zoneDownloadRetries) {
+            Integer prev = zoneDownloadRetries.get(name);
+            attempt = prev == null ? 1 : prev + 1;
+            zoneDownloadRetries.put(name, attempt);
+        }
+        long delay = Math.min(300_000L, 30_000L << Math.min(attempt - 1, 3)); // 30s,60s,2m,4m→5m cap
+        ui.postDelayed(() -> {
+            String freshUrl = wantedVideoUrls.get(name); // newest presign for this path
+            if (freshUrl == null) return;                // no longer on the template
+            File f = new File(tplCacheDir(), name);
+            if (f.exists() && f.length() > 0) return;    // landed meanwhile
+            Log.d(TAG, "retrying zone video cache (attempt " + (attempt + 1) + "): " + freshUrl);
+            downloadZoneVideoAsync(freshUrl);
+        }, delay);
     }
 
     /**
@@ -614,7 +688,9 @@ public class TemplateRenderer {
             for (File f : files) {
                 String n = f.getName();
                 if (n.endsWith(".part")) continue; // in-flight download
-                if (!wanted.contains(n) && f.delete()) {
+                // Quarantined copies (.bad) live and die with their base file.
+                String base = n.endsWith(".bad") ? n.substring(0, n.length() - 4) : n;
+                if (!wanted.contains(base) && f.delete()) {
                     Log.d(TAG, "pruned stale zone media: " + n);
                 }
             }

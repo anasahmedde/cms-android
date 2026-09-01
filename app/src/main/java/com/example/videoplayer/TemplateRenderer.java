@@ -426,6 +426,9 @@ public class TemplateRenderer {
             // the same file and only a real content change re-downloads.
             final File cached = cachedZoneVideo(url);
             final boolean playingLocal = cached != null;
+            // Tracks WHAT the player is currently fed (cache vs stream) across
+            // the fallback/restore/switch transitions below.
+            final boolean[] localNow = { playingLocal };
             player.setMediaItem(MediaItem.fromUri(playingLocal
                     ? android.net.Uri.fromFile(cached).toString() : url));
             player.setRepeatMode(Player.REPEAT_MODE_ALL);
@@ -436,7 +439,7 @@ public class TemplateRenderer {
                 private boolean fellBack = false;
                 private boolean restored = false;
                 @Override public void onPlayerError(PlaybackException error) {
-                    Log.w(TAG, "zone video error (" + (playingLocal && !fellBack ? "cache" : "stream")
+                    Log.w(TAG, "zone video error (" + (localNow[0] ? "cache" : "stream")
                             + " " + url + "): " + error.getErrorCodeName());
                     // A corrupt cached file can never recover — QUARANTINE it
                     // (rename to .bad, never delete) and fall back to streaming
@@ -445,11 +448,13 @@ public class TemplateRenderer {
                     // copy is ALL we have. If streaming then fails anyway (the
                     // network was lying, or it dropped mid-fallback), the .bad
                     // file is restored below — the only copy is never destroyed.
-                    if (playingLocal && !fellBack && isOnline()) {
+                    if (localNow[0] && !fellBack && isOnline()) {
                         fellBack = true;
+                        File cur = cachedZoneVideo(url);
                         File bad = new File(tplCacheDir(), cacheName(url, ".vid") + ".bad");
-                        try { cached.renameTo(bad); } catch (Exception ignored) { }
+                        if (cur != null) { try { cur.renameTo(bad); } catch (Exception ignored) { } }
                         downloadZoneVideoAsync(url);
+                        localNow[0] = false;
                         try {
                             player.setMediaItem(MediaItem.fromUri(url));
                             player.prepare();
@@ -469,6 +474,7 @@ public class TemplateRenderer {
                                 : (bad.exists() && bad.renameTo(orig)) ? orig : null;
                         if (src != null) {
                             Log.w(TAG, "zone video stream fallback failed — restoring cached copy: " + url);
+                            localNow[0] = true;
                             try {
                                 player.setMediaItem(MediaItem.fromUri(android.net.Uri.fromFile(src).toString()));
                                 player.prepare();
@@ -491,10 +497,51 @@ public class TemplateRenderer {
             player.prepare();
             holder.addView(pv, new FrameLayout.LayoutParams(
                     FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
-            if (!playingLocal) downloadZoneVideoAsync(url);
+            if (!playingLocal) {
+                downloadZoneVideoAsync(url);
+                // Streaming is a STOPGAP for the first sight of a new video, not
+                // a mode: switch to the local copy the moment the download lands.
+                // Before this, a zone streamed until the next template rebuild —
+                // possibly DAYS — and an internet drop froze it even though the
+                // finished file was sitting on disk.
+                watchForCachedCopy(player, url, localNow);
+            }
         } catch (Exception e) {
             Log.w(TAG, "zone video setup failed: " + e.getMessage());
         }
+    }
+
+    /**
+     * Poll (cheap file-exists check, 10s) until the download for a streaming
+     * zone lands, then swap the player onto the local copy — keeping the
+     * playback position, so the switch is invisible. Stops when the player is
+     * released (template swap/clear) or once switched. Also covers downloads
+     * that land minutes later via the retry loop.
+     */
+    private void watchForCachedCopy(final ExoPlayer player, final String url, final boolean[] localNow) {
+        final Runnable check = new Runnable() {
+            @Override public void run() {
+                if (!zonePlayers.contains(player)) return; // released — stop watching
+                if (localNow[0]) return;                   // already on a local copy
+                File cachedNow = cachedZoneVideo(url);
+                if (cachedNow == null) {
+                    ui.postDelayed(this, 10_000L);
+                    return;
+                }
+                try {
+                    Log.d(TAG, "zone video switching stream → cached copy: " + url);
+                    localNow[0] = true;
+                    player.setMediaItem(MediaItem.fromUri(
+                            android.net.Uri.fromFile(cachedNow).toString()), /*resetPosition=*/ false);
+                    player.prepare();
+                    player.play();
+                } catch (Exception e) {
+                    localNow[0] = false;
+                    Log.w(TAG, "stream → cache switch failed (keeps streaming): " + e.getMessage());
+                }
+            }
+        };
+        ui.postDelayed(check, 5_000L);
     }
 
     /** Release every zone video player. MUST be called when the overlay is swapped/removed. */

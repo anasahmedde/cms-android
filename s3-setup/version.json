@@ -1,0 +1,9 @@
+{
+  "versionCode": 24,
+  "versionName": "10.2.5",
+  "apkUrl": "https://dgx-release-bucket.s3.us-east-2.amazonaws.com/releases/app-v10.2.5.apk",
+  "checksum": "b028bf6c545ac701bbdf4786466f9d40b4d12e1dd8ce72018c39b8cf1eeac486",
+  "releaseNotes": "Offline reliability: every video is stored on the screen and played from there within seconds of arriving, so an internet outage - even for days - never freezes or blanks the content.",
+  "forceUpdate": false,
+  "rolloutPercent": 100
+}

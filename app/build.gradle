@@ -2,26 +2,54 @@ plugins {
     alias(libs.plugins.android.application)
 }
 
+// Release signing config is read from a gitignored keystore.properties so the
+// keystore path/passwords never enter git. See RELEASE.md. Without the file
+// (e.g. a plain CI build) the release type is simply left unsigned.
+def keystorePropsFile = rootProject.file("keystore.properties")
+def hasKeystore = keystorePropsFile.exists()
+def keystoreProps = new Properties()
+if (hasKeystore) {
+    keystoreProps.load(new FileInputStream(keystorePropsFile))
+}
+
 android {
     namespace 'com.example.videoplayer'
     compileSdk 36
 
     defaultConfig {
         applicationId "com.example.videoplayer"
-        minSdk 29
+        minSdk 21
         targetSdk 36
-        versionCode 1
-        versionName "1.0"
+        versionCode 24
+        versionName "10.2.5"
 
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+    }
+
+    signingConfigs {
+        release {
+            if (hasKeystore) {
+                storeFile file(keystoreProps['storeFile'])
+                storePassword keystoreProps['storePassword']
+                keyAlias keystoreProps['keyAlias']
+                keyPassword keystoreProps['keyPassword']
+            }
+        }
     }
 
     buildTypes {
         release {
             minifyEnabled false
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+            if (hasKeystore) {
+                signingConfig signingConfigs.release
+            }
         }
     }
+    buildFeatures {
+        buildConfig true
+    }
+
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_11
         targetCompatibility JavaVersion.VERSION_11
@@ -48,4 +76,7 @@ dependencies {
 
     // Networking
     implementation "com.squareup.okhttp3:okhttp:4.12.0"
+
+    // WorkManager for background update checks
+    implementation "androidx.work:work-runtime:2.9.0"
 }

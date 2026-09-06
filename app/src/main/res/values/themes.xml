@@ -6,4 +6,18 @@
     </style>
 
     <style name="Theme.Videoplayer" parent="Base.Theme.Videoplayer" />
+
+    <!--
+        DGX Player activity theme — black window background.
+        This eliminates the white flash that appears between the system creating
+        the activity window and setContentView() rendering the layout.
+        The layout already has android:background="#000000" on the root FrameLayout,
+        so this just makes the window match.
+    -->
+    <style name="Theme.DGXPlayer.Black" parent="Theme.AppCompat.Light.NoActionBar">
+        <item name="android:windowBackground">@android:color/black</item>
+        <item name="android:colorBackground">@android:color/black</item>
+        <item name="android:windowIsTranslucent">false</item>
+        <item name="android:windowDisablePreview">false</item>
+    </style>
 </resources>

@@ -4,8 +4,8 @@
 
 ## Operational warnings
 
-- **The live fleet (v7.0.4) has the STAGING API URL baked in** — an APK's base URL decides which backend real devices talk to. Any URL change is a fleet-wide event; treat it as a release decision, never a casual edit.
-- **The authoritative branch is `release-1.1`** — GitHub `staging` and `main` are stale (Feb 2026). Base work on `release-1.1` until branches are normalized (goal: release-1.1 → staging → main, then follow the standard flow).
+- **An APK's base URL decides which backend real devices talk to.** The committed source has `API_BASE` on staging with production commented above it; the published fleet build (v10.2.5 / vc24) is the **production-URL** build, flipped at build time. Any URL change is a fleet-wide event — treat it as a release decision, never a casual edit.
+- **Branches are normalized (2026-09-06): `staging` and `main` are current and identical**, both containing everything through v10.2.5 (vc24). Use the standard `feature/* → staging → main` flow. `release-1.1` is fully merged into both and is now historical — do not base new work on it.
 - The signing keystore (`dgx-player.jks`) exists only on one machine with no backup. Before any release: back up / escrow the keystore. Losing it permanently breaks fleet self-update.
 - Fleet state is invisible: the heartbeat carries no app version. When touching the heartbeat, add version telemetry.
 
